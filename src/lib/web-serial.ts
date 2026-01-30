@@ -164,8 +164,10 @@ export async function sendSerialData(device: SerialDevice, data: Uint8Array): Pr
  * For ASK RDR-518: Uses multi-step protocol:
  * 1. Send command
  * 2. Receive ACK (0x01)
- * 3. Send empty message
+ * 3. Send empty message to poll
  * 4. Receive actual payload
+ *
+ * IMPORTANT: No delays between operations - CDC timing is critical
  */
 export async function transceiveSerial(
   device: SerialDevice,
@@ -184,49 +186,116 @@ export async function transceiveSerial(
   log('TX', `Command (${command.length} bytes): ${toHexSerial(command)}`);
   await sendSerialData(device, command);
 
-  // Step 2: Wait for and read the initial response (ACK or immediate response)
+  // Step 2: Read initial response immediately (no delay - CDC timing is critical)
   log('INFO', 'Waiting for initial response...');
-  await new Promise(resolve => setTimeout(resolve, 50));
-
-  const initialResponse = await receiveSerialData(device, 500);
+  const initialResponse = await readWithRetry(device, timeout);
   log('RX', `Initial (${initialResponse.length} bytes): ${toHexSerial(initialResponse)}`);
 
   // Check if this is an ACK (0x01) requiring us to poll for the actual response
   if (initialResponse.length === 1 && initialResponse[0] === 0x01) {
     log('INFO', 'Received ACK (0x01), sending empty poll message...');
 
-    // Step 3: Send empty message to poll for actual response
+    // Step 3: Send empty message to poll for actual response (no delay)
     const emptyMessage = new Uint8Array(0);
     log('TX', `Poll (empty message)`);
     await sendSerialData(device, emptyMessage);
 
-    // Step 4: Wait for and read the actual response
+    // Step 4: Read the actual response immediately
     log('INFO', 'Waiting for actual payload...');
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    const actualResponse = await receiveSerialFrame(device, timeout);
+    const actualResponse = await readWithRetry(device, timeout);
     log('RX', `Payload (${actualResponse.length} bytes): ${toHexSerial(actualResponse)}`);
 
     return actualResponse;
   }
 
-  // If not an ACK, check if we got a complete frame directly
-  if (isCompleteFrame(initialResponse)) {
-    log('INFO', 'Received complete frame directly');
-    return initialResponse;
+  // If we got data, check if it's a complete frame
+  if (initialResponse.length > 0) {
+    if (isCompleteFrame(initialResponse)) {
+      log('INFO', 'Received complete frame directly');
+      return initialResponse;
+    }
+
+    // Partial data - continue reading
+    log('INFO', 'Partial data received, continuing to read...');
+    const remainingData = await receiveSerialFrame(device, timeout);
+
+    const combined = new Uint8Array(initialResponse.length + remainingData.length);
+    combined.set(initialResponse);
+    combined.set(remainingData, initialResponse.length);
+
+    log('RX', `Combined (${combined.length} bytes): ${toHexSerial(combined)}`);
+    return combined;
   }
 
-  // Otherwise, continue reading for more data
-  log('INFO', 'Partial data received, continuing to read...');
-  const remainingData = await receiveSerialFrame(device, timeout);
+  // No data received
+  log('INFO', 'No initial response received');
+  return initialResponse;
+}
 
-  // Combine initial and remaining data
-  const combined = new Uint8Array(initialResponse.length + remainingData.length);
-  combined.set(initialResponse);
-  combined.set(remainingData, initialResponse.length);
+/**
+ * Read data with retry - keeps polling until data arrives or timeout
+ */
+async function readWithRetry(
+  device: SerialDevice,
+  timeout: number
+): Promise<Uint8Array> {
+  if (!device.reader) {
+    throw new Error('Serial port reader not available');
+  }
 
-  log('RX', `Combined (${combined.length} bytes): ${toHexSerial(combined)}`);
-  return combined;
+  const startTime = Date.now();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  while (Date.now() - startTime < timeout) {
+    const remainingTime = Math.max(100, timeout - (Date.now() - startTime));
+
+    try {
+      const readPromise = device.reader.read();
+      const timeoutPromise = new Promise<{ value: undefined; done: true }>((resolve) =>
+        setTimeout(() => resolve({ value: undefined, done: true }), Math.min(200, remainingTime))
+      );
+
+      const result = await Promise.race([readPromise, timeoutPromise]);
+
+      if (result.value && result.value.length > 0) {
+        chunks.push(result.value);
+        totalBytes += result.value.length;
+        log('RX', `Chunk (${result.value.length} bytes): ${toHexSerial(result.value)}`);
+
+        // Check if we have a complete response
+        const combined = combineChunks(chunks, totalBytes);
+
+        // For ACK (single byte 0x01), return immediately
+        if (combined.length === 1 && combined[0] === 0x01) {
+          return combined;
+        }
+
+        // For complete frames, return
+        if (isCompleteFrame(combined)) {
+          return combined;
+        }
+
+        // Give a tiny bit of time for more data to arrive
+        await new Promise(resolve => setTimeout(resolve, 10));
+        continue;
+      }
+
+      // No data this round - if we have some data already, wait a bit more
+      if (totalBytes > 0) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        // Check if more data came
+        continue;
+      }
+
+      // No data yet - keep waiting
+    } catch (error) {
+      log('INFO', `Read error: ${error instanceof Error ? error.message : String(error)}`);
+      break;
+    }
+  }
+
+  return combineChunks(chunks, totalBytes);
 }
 
 /**
@@ -257,51 +326,6 @@ async function clearSerialBuffer(device: SerialDevice): Promise<void> {
   if (clearedBytes > 0) {
     log('INFO', `Cleared ${clearedBytes} stale bytes from buffer`);
   }
-}
-
-/**
- * Receive data from serial port (single read with timeout)
- */
-async function receiveSerialData(
-  device: SerialDevice,
-  timeout: number
-): Promise<Uint8Array> {
-  if (!device.reader) {
-    throw new Error('Serial port reader not available');
-  }
-
-  const chunks: Uint8Array[] = [];
-  const startTime = Date.now();
-  let totalBytes = 0;
-
-  // Read until we get some data or timeout
-  while (Date.now() - startTime < timeout) {
-    const remainingTime = Math.max(50, timeout - (Date.now() - startTime));
-
-    const readPromise = device.reader.read();
-    const timeoutPromise = new Promise<{ value: undefined; done: true }>((resolve) =>
-      setTimeout(() => resolve({ value: undefined, done: true }), Math.min(100, remainingTime))
-    );
-
-    const result = await Promise.race([readPromise, timeoutPromise]);
-
-    if (result.value && result.value.length > 0) {
-      chunks.push(result.value);
-      totalBytes += result.value.length;
-
-      // Small delay to allow more data to arrive if this is a partial read
-      await new Promise(resolve => setTimeout(resolve, 20));
-
-      // Check if more data is immediately available
-      continue;
-    } else if (totalBytes > 0) {
-      // We have data and no more is coming
-      break;
-    }
-    // No data yet, keep waiting
-  }
-
-  return combineChunks(chunks, totalBytes);
 }
 
 /**
