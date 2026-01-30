@@ -149,8 +149,14 @@ export async function transceiveSerial(
   await device.writer.write(command);
 
   // Read response
-  const response = await readWithTimeout(device, timeout);
+  let response = await readWithTimeout(device, timeout);
   log('RX', `Response (${response.length} bytes): ${toHexSerial(response)}`);
+
+  // Strip leading DLE bytes (0x10) - device sends these on first command after connect
+  while (response.length > 0 && response[0] === 0x10) {
+    log('INFO', 'Stripping DLE byte (0x10)');
+    response = response.slice(1);
+  }
 
   // Handle ACK prefix (0x01)
   if (response.length > 1 && response[0] === 0x01) {
@@ -232,6 +238,15 @@ function combineChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
  */
 function isCompleteFrame(data: Uint8Array): boolean {
   if (data.length < 4) return false;
+
+  // Skip leading DLE bytes (0x10) - device sends these on first command after connect
+  let offset = 0;
+  while (offset < data.length && data[offset] === 0x10) {
+    offset++;
+  }
+  if (offset > 0) {
+    return isCompleteFrame(data.slice(offset));
+  }
 
   const len = data[0];
 
