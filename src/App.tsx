@@ -503,7 +503,7 @@ function App() {
             </button>
           </div>
           <p className="text-gray-500 text-sm mt-2">
-            Enter hex bytes separated by spaces (CRC will be calculated automatically)
+            Enter complete command with CRC (e.g. 80 02 01 01 00 50 3F)
           </p>
         </section>
 
