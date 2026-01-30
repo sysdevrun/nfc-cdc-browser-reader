@@ -133,6 +133,10 @@ function App() {
       }
     } else {
       addLog('info', result.message);
+      // Clear card info when no card found
+      setLastUid('');
+      setLastAtqa('');
+      setLastSak('');
       if (result.hexData) {
         addLog('response', `Raw: ${result.hexData}`);
       }
@@ -194,7 +198,13 @@ function App() {
                 await beepSuccess(device);
               }
             } else {
-              lastDetectedUid = '';
+              // Clear display when card is removed
+              if (lastDetectedUid !== '') {
+                lastDetectedUid = '';
+                setLastUid('');
+                setLastAtqa('');
+                setLastSak('');
+              }
             }
           } catch {
             // Ignore hunt errors
