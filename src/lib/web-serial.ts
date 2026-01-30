@@ -127,11 +127,63 @@ export async function sendSerialData(device: SerialDevice, data: Uint8Array): Pr
 }
 
 /**
- * Receive data from serial port with timeout
+ * Send command and receive response
+ * For ASK RDR-518: response format is [LEN] [DATA...] [CRC-16]
  */
-export async function receiveSerialData(
+export async function transceiveSerial(
   device: SerialDevice,
+  command: Uint8Array,
   timeout: number = 2000
+): Promise<Uint8Array> {
+  if (!device.reader || !device.writer) {
+    throw new Error('Serial port not ready');
+  }
+
+  // Clear any stale data in the buffer first
+  await clearSerialBuffer(device);
+
+  // Send the command
+  await sendSerialData(device, command);
+
+  // Wait for device to process command and perform RF operation
+  await new Promise(resolve => setTimeout(resolve, 150));
+
+  // Read response, looking for a complete frame
+  return await receiveSerialFrame(device, timeout);
+}
+
+/**
+ * Clear any stale data from the serial buffer
+ */
+async function clearSerialBuffer(device: SerialDevice): Promise<void> {
+  if (!device.reader) return;
+
+  const startTime = Date.now();
+  while (Date.now() - startTime < 100) {
+    try {
+      const readPromise = device.reader.read();
+      const timeoutPromise = new Promise<{ value: undefined; done: true }>((resolve) =>
+        setTimeout(() => resolve({ value: undefined, done: true }), 20)
+      );
+      const result = await Promise.race([readPromise, timeoutPromise]);
+      if (result.done || !result.value || result.value.length === 0) {
+        break; // Buffer is empty
+      }
+      // Discard stale data and continue clearing
+    } catch {
+      break;
+    }
+  }
+}
+
+/**
+ * Receive a complete frame from serial port
+ * Frame format: [LEN] [DATA...] [CRC-16]
+ * LEN=0x04 for no-card (8 bytes total), LEN=0x0b for card-found (15 bytes total)
+ */
+async function receiveSerialFrame(
+  device: SerialDevice,
+  timeout: number
 ): Promise<Uint8Array> {
   if (!device.reader) {
     throw new Error('Serial port reader not available');
@@ -139,70 +191,71 @@ export async function receiveSerialData(
 
   const chunks: Uint8Array[] = [];
   const startTime = Date.now();
+  let totalBytes = 0;
 
-  try {
-    while (Date.now() - startTime < timeout) {
-      const readPromise = device.reader.read();
-      const timeoutPromise = new Promise<{ value: undefined; done: true }>((resolve) =>
-        setTimeout(() => resolve({ value: undefined, done: true }), Math.max(100, timeout - (Date.now() - startTime)))
-      );
+  while (Date.now() - startTime < timeout) {
+    const remainingTime = Math.max(50, timeout - (Date.now() - startTime));
 
-      const result = await Promise.race([readPromise, timeoutPromise]);
+    const readPromise = device.reader.read();
+    const timeoutPromise = new Promise<{ value: undefined; done: true }>((resolve) =>
+      setTimeout(() => resolve({ value: undefined, done: true }), Math.min(300, remainingTime))
+    );
 
-      if (result.done) {
-        break;
+    const result = await Promise.race([readPromise, timeoutPromise]);
+
+    if (result.value && result.value.length > 0) {
+      chunks.push(result.value);
+      totalBytes += result.value.length;
+
+      // Check if we have a complete frame
+      const combined = combineChunks(chunks, totalBytes);
+      if (isCompleteFrame(combined)) {
+        return combined;
       }
-
-      if (result.value && result.value.length > 0) {
-        chunks.push(result.value);
-        // If we received data, wait a bit more for additional data
+    } else if (result.done) {
+      // Timeout on this read, but keep trying if we don't have data yet
+      if (totalBytes > 0) {
+        // We have some data, wait a bit more then check
         await new Promise(resolve => setTimeout(resolve, 50));
       }
     }
-  } catch (error) {
-    console.error('Read error:', error);
   }
 
-  // Combine all chunks
-  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  // Return whatever we got
+  return combineChunks(chunks, totalBytes);
+}
+
+/**
+ * Helper to combine chunks into a single Uint8Array
+ */
+function combineChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
   const result = new Uint8Array(totalLength);
   let offset = 0;
   for (const chunk of chunks) {
     result.set(chunk, offset);
     offset += chunk.length;
   }
-
   return result;
 }
 
 /**
- * Send command and receive response
+ * Check if we have a complete frame based on LEN byte
  */
-export async function transceiveSerial(
-  device: SerialDevice,
-  command: Uint8Array,
-  timeout: number = 2000
-): Promise<Uint8Array> {
-  // Clear any pending data first
-  if (device.reader) {
-    try {
-      // Quick read to clear buffer
-      const clearPromise = device.reader.read();
-      const quickTimeout = new Promise<{ done: true }>((resolve) =>
-        setTimeout(() => resolve({ done: true }), 50)
-      );
-      await Promise.race([clearPromise, quickTimeout]);
-    } catch {
-      // Ignore clear errors
-    }
-  }
+function isCompleteFrame(data: Uint8Array): boolean {
+  if (data.length < 4) return false;
 
-  await sendSerialData(device, command);
+  const len = data[0];
 
-  // Small delay to allow device to process
-  await new Promise(resolve => setTimeout(resolve, 50));
+  // Known frame sizes for ASK RDR-518:
+  // LEN=0x04: no-card response, total 8 bytes (4 + 2 data + 2 CRC)
+  // LEN=0x0b: card-found response, total 15 bytes
+  if (len === 0x04 && data.length >= 8) return true;
+  if (len === 0x0b && data.length >= 15) return true;
 
-  return await receiveSerialData(device, timeout);
+  // Generic check: LEN + 4 bytes (header estimate)
+  if (data.length >= len + 4) return true;
+
+  return false;
 }
 
 /**
