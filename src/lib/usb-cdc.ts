@@ -20,6 +20,7 @@ export interface CdcConnectionResult {
 
 // Known NFC reader USB vendor/product IDs
 export const KNOWN_NFC_READERS = [
+  { vendorId: 0x1fd3, productId: 0x0108, name: 'RDR-518 NFC Reader' },
   { vendorId: 0x072f, productId: 0x2200, name: 'ACS ACR122U' },
   { vendorId: 0x072f, productId: 0x223b, name: 'ACS ACR1252U' },
   { vendorId: 0x072f, productId: 0x8911, name: 'ACS ACR1281S-C1 (ACR518)' },
@@ -53,6 +54,8 @@ export async function requestDevice(): Promise<CdcConnectionResult> {
     // Request any USB device - user will select from the popup
     const device = await navigator.usb.requestDevice({
       filters: [
+        // RDR-518 NFC Reader
+        { vendorId: 0x1fd3 },
         // ACS readers
         { vendorId: 0x072f },
         // Common USB-Serial chips
