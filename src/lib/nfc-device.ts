@@ -65,27 +65,32 @@ export const LED = {
 } as const;
 
 /**
- * Calculate CRC-16 CCITT checksum
- * Polynomial: 0x1021, Initial: 0xFFFF, No reflection
+ * Calculate CRC-16-X.25 checksum (used by ASK CSC protocol)
+ * Polynomial: 0x1021 (reflected as 0x8408)
+ * Initial: 0xFFFF
+ * Input reflection: Yes
+ * Output reflection: Yes
+ * Final XOR: 0xFFFF
  */
-export function crc16Ccitt(data: Uint8Array): number {
+export function crc16X25(data: Uint8Array): number {
   let crc = 0xFFFF;
   for (const byte of data) {
-    crc ^= byte << 8;
+    crc ^= byte;
     for (let i = 0; i < 8; i++) {
-      if (crc & 0x8000) {
-        crc = (crc << 1) ^ 0x1021;
+      if (crc & 1) {
+        crc = (crc >> 1) ^ 0x8408; // Reflected polynomial
       } else {
-        crc <<= 1;
+        crc >>= 1;
       }
-      crc &= 0xFFFF;
     }
   }
-  return crc;
+  return crc ^ 0xFFFF; // Final XOR
 }
 
 /**
  * Build a complete command frame with CRC
+ * Frame structure: CMD, LEN, CLASS, IDENT, DATA, 0x00 (terminator), CRC-16
+ * LEN = CLASS + IDENT + DATA length (does NOT include terminator)
  */
 export function buildCommand(
   cmd: number,
@@ -94,18 +99,24 @@ export function buildCommand(
   data: Uint8Array = new Uint8Array(0)
 ): Uint8Array {
   const length = 2 + data.length; // CLASS + IDENT + DATA
-  const frame = new Uint8Array(4 + data.length);
-  frame[0] = cmd;
-  frame[1] = length;
-  frame[2] = classId;
-  frame[3] = ident;
-  frame.set(data, 4);
 
-  const crc = crc16Ccitt(frame);
-  const result = new Uint8Array(frame.length + 2);
-  result.set(frame);
-  result[frame.length] = crc & 0xFF; // Low byte
-  result[frame.length + 1] = (crc >> 8) & 0xFF; // High byte
+  // Frame: CMD, LEN, CLASS, IDENT, DATA, 0x00 (terminator)
+  const frameWithTerminator = new Uint8Array(4 + data.length + 1);
+  frameWithTerminator[0] = cmd;
+  frameWithTerminator[1] = length;
+  frameWithTerminator[2] = classId;
+  frameWithTerminator[3] = ident;
+  frameWithTerminator.set(data, 4);
+  frameWithTerminator[4 + data.length] = 0x00; // Terminator byte
+
+  // CRC is calculated over entire frame including terminator
+  const crc = crc16X25(frameWithTerminator);
+
+  // Final result: frame + CRC (little-endian)
+  const result = new Uint8Array(frameWithTerminator.length + 2);
+  result.set(frameWithTerminator);
+  result[frameWithTerminator.length] = crc & 0xFF; // Low byte
+  result[frameWithTerminator.length + 1] = (crc >> 8) & 0xFF; // High byte
 
   return result;
 }
@@ -115,6 +126,7 @@ export function buildCommand(
  * Based on working command: 80 0A 01 03 00 00 02 11 03 01 01 14 00 9C F8
  *
  * This is CSC_SearchCardExt with extended parameters for ISO-A and MIFARE detection.
+ * Data is 8 bytes, terminator 00 is added by buildCommand.
  */
 export function buildHuntCommand(options: {
   isoa?: boolean;
@@ -133,7 +145,7 @@ export function buildHuntCommand(options: {
     antenna = 2,        // Antenna number (1-4)
   } = options;
 
-  // Data structure (CSC_SearchCardExt - 9 bytes):
+  // Data structure (CSC_SearchCardExt - 8 bytes):
   // Byte 0: CONT    - Contact mode (0x00 = disabled)
   // Byte 1: ISOB    - ISO 14443-B (0x00 = disabled, 0x01-0x04 = antenna number)
   // Byte 2: ISOA    - ISO 14443-A (0x00 = disabled, 0x01-0x04 = antenna number)
@@ -142,7 +154,6 @@ export function buildHuntCommand(options: {
   // Byte 5: FLAGS   - Search flags (0x01 = additional flags)
   // Byte 6: FORGET  - Forget previous card (0x00 = remember, 0x01 = forget)
   // Byte 7: TIMEOUT - Search timeout (value × 10ms)
-  // Byte 8: RFU     - Reserved (0x00)
   const data = new Uint8Array([
     0x00,                               // CONT: disabled
     isob ? antenna : 0x00,              // ISOB: antenna number or disabled
@@ -152,7 +163,6 @@ export function buildHuntCommand(options: {
     0x01,                               // FLAGS: 0x01 (search flags)
     forget ? 0x01 : 0x00,               // FORGET: forget previous card
     timeout10ms,                        // TIMEOUT: x10ms
-    0x00,                               // RFU: reserved
   ]);
 
   return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_ENTER_HUNT_PHASE, data);
