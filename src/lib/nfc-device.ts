@@ -21,6 +21,17 @@ export interface NfcCommandResult {
   comType?: number;
 }
 
+export interface NfcVersionInfo {
+  raw: string;
+  model?: string;
+  type?: string;
+  version?: string;
+  interface?: string;
+  buildDate?: string;
+  buildTime?: string;
+  manufacturer: string;
+}
+
 // ASK CSC Protocol Constants
 const CMD_EXECUTE = 0x80;
 
@@ -28,7 +39,9 @@ const CMD_EXECUTE = 0x80;
 const CLASS_SYSTEM = 0x01;
 
 // System Commands
+const SYS_SOFTWARE_VERSION = 0x01;
 const SYS_ENTER_HUNT_PHASE = 0x03;
+const SYS_END_TAG_COMMUNICATION = 0x04;
 const SYS_SWITCH_SIGNALS = 0x18;
 
 // Communication Types
@@ -133,6 +146,54 @@ export function buildHuntCommand(options: {
 export function buildLedCommand(param: number): Uint8Array {
   const data = new Uint8Array([param & 0xFF, (param >> 8) & 0xFF]);
   return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_SWITCH_SIGNALS, data);
+}
+
+/**
+ * Build get software version command
+ */
+export function buildGetVersionCommand(): Uint8Array {
+  return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_SOFTWARE_VERSION);
+}
+
+/**
+ * Build end tag communication command
+ * @param disconnect - true to disconnect card, false to keep in field
+ */
+export function buildEndTagCommand(disconnect: boolean = true): Uint8Array {
+  const data = new Uint8Array([disconnect ? 0x01 : 0x00]);
+  return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_END_TAG_COMMUNICATION, data);
+}
+
+/**
+ * Parse software version response
+ */
+export function parseVersionResponse(response: Uint8Array): NfcVersionInfo | null {
+  if (response.length < 6) {
+    return null;
+  }
+
+  // Version string starts at byte 3, ends before CRC (last 2 bytes)
+  const versionBytes = response.subarray(3, response.length - 2);
+
+  // Decode as ASCII, remove null terminators
+  const raw = Array.from(versionBytes)
+    .map(b => b === 0 ? '' : String.fromCharCode(b))
+    .join('')
+    .trim();
+
+  // Parse components: "GEN5XX CSC 01.20<USB> Jul 31 2014 16:16:21 (C) ASK  SAM?"
+  const parts = raw.split(/\s+/);
+
+  return {
+    raw,
+    model: parts[0] || undefined,
+    type: parts[1] || undefined,
+    version: parts[2] || undefined,
+    interface: parts[3]?.replace(/[<>]/g, '') || undefined,
+    buildDate: parts.length > 6 ? `${parts[4]} ${parts[5]} ${parts[6]}` : undefined,
+    buildTime: parts[7] || undefined,
+    manufacturer: 'ASK',
+  };
 }
 
 /**
@@ -301,6 +362,52 @@ export async function setLeds(device: NfcDevice, param: number): Promise<boolean
   const command = buildLedCommand(param);
   const result = await sendCommand(device, command);
   return result.success && !!result.data && result.data.length >= 4 && result.data[3] === 0x00;
+}
+
+/**
+ * Get firmware version from reader
+ */
+export async function getFirmwareVersion(device: NfcDevice): Promise<{ success: boolean; version?: NfcVersionInfo; message: string; hexData?: string }> {
+  const command = buildGetVersionCommand();
+  const result = await sendCommand(device, command);
+
+  if (result.success && result.data) {
+    const version = parseVersionResponse(result.data);
+    if (version) {
+      return {
+        success: true,
+        version,
+        message: `${version.model} ${version.type} v${version.version}`,
+        hexData: result.hexData,
+      };
+    }
+  }
+
+  return {
+    success: false,
+    message: result.message || 'Failed to get firmware version',
+    hexData: result.hexData,
+  };
+}
+
+/**
+ * End tag communication (disconnect card)
+ */
+export async function endTagCommunication(device: NfcDevice, disconnect: boolean = true): Promise<NfcCommandResult> {
+  const command = buildEndTagCommand(disconnect);
+  const result = await sendCommand(device, command);
+
+  if (result.success && result.data && result.data.length >= 4) {
+    const status = result.data[3];
+    return {
+      success: status === 0x01,
+      data: result.data,
+      hexData: result.hexData,
+      message: status === 0x01 ? 'Card disconnected' : `End tag failed: status=0x${status.toString(16)}`,
+    };
+  }
+
+  return result;
 }
 
 /**

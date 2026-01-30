@@ -7,11 +7,14 @@ import {
 } from './lib/web-serial';
 import {
   NfcDevice,
+  NfcVersionInfo,
   getCardUid,
   cardHunt,
   sendCustomCommand,
   setLeds,
   beepSuccess,
+  getFirmwareVersion,
+  endTagCommunication,
   LED,
   toHex,
   buildHuntCommand,
@@ -36,6 +39,7 @@ function App() {
   const [huntTimeout, setHuntTimeout] = useState<number>(68); // 680ms in 10ms units
   const [huntIsoA, setHuntIsoA] = useState<boolean>(true);
   const [huntIsoB, setHuntIsoB] = useState<boolean>(false);
+  const [firmwareInfo, setFirmwareInfo] = useState<NfcVersionInfo | null>(null);
   const pollingRef = useRef<boolean>(false);
   const huntingRef = useRef<boolean>(false);
 
@@ -91,6 +95,7 @@ function App() {
       setLastUid('');
       setLastAtqa('');
       setLastSak('');
+      setFirmwareInfo(null);
       addLog('info', 'Disconnected from device');
     }
   };
@@ -302,6 +307,54 @@ function App() {
     }
   };
 
+  const handleGetFirmware = async () => {
+    if (!device) {
+      addLog('error', 'No device connected');
+      return;
+    }
+
+    addLog('command', 'Getting firmware version...');
+    const result = await getFirmwareVersion(device);
+
+    if (result.success && result.version) {
+      setFirmwareInfo(result.version);
+      addLog('success', result.message);
+      addLog('response', `Raw: ${result.version.raw}`);
+      if (result.hexData) {
+        addLog('response', `Hex: ${result.hexData}`);
+      }
+    } else {
+      addLog('error', result.message);
+      if (result.hexData) {
+        addLog('response', `Raw: ${result.hexData}`);
+      }
+    }
+  };
+
+  const handleEndTag = async (disconnect: boolean) => {
+    if (!device) {
+      addLog('error', 'No device connected');
+      return;
+    }
+
+    addLog('command', `End tag communication (disconnect=${disconnect})...`);
+    const result = await endTagCommunication(device, disconnect);
+
+    if (result.success) {
+      addLog('success', result.message);
+      if (disconnect) {
+        setLastUid('');
+        setLastAtqa('');
+        setLastSak('');
+      }
+    } else {
+      addLog('error', result.message);
+    }
+    if (result.hexData) {
+      addLog('response', `Raw: ${result.hexData}`);
+    }
+  };
+
   const serialSupported = isWebSerialSupported();
 
   return (
@@ -342,6 +395,12 @@ function App() {
                   <span className="text-green-400 font-medium">{device.name}</span>
                 </div>
                 <button
+                  onClick={handleGetFirmware}
+                  className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg font-medium transition-colors"
+                >
+                  Get Firmware
+                </button>
+                <button
                   onClick={handleDisconnect}
                   className="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg font-medium transition-colors"
                 >
@@ -350,6 +409,19 @@ function App() {
               </>
             )}
           </div>
+          {firmwareInfo && (
+            <div className="mt-4 p-3 bg-gray-700/50 rounded-lg text-sm">
+              <div className="text-gray-300">
+                <span className="text-blue-400 font-medium">Firmware:</span>{' '}
+                {firmwareInfo.model} {firmwareInfo.type} v{firmwareInfo.version}
+              </div>
+              {firmwareInfo.buildDate && (
+                <div className="text-gray-400">
+                  Build: {firmwareInfo.buildDate} {firmwareInfo.buildTime}
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
         {/* UID Display */}
@@ -458,6 +530,17 @@ function App() {
                 }`}
               >
                 {isPolling ? 'Stop Poll' : 'Auto Poll'}
+              </button>
+              <button
+                onClick={() => handleEndTag(true)}
+                disabled={!device}
+                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                  device
+                    ? 'bg-red-700 hover:bg-red-600 text-white'
+                    : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+                }`}
+              >
+                End Tag
               </button>
             </div>
           </div>
