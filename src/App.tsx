@@ -1,9 +1,10 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   isWebSerialSupported,
   requestSerialPort,
   disconnectSerialPort,
   getSerialPortInfo,
+  setSerialLogCallback,
 } from './lib/web-serial';
 import {
   NfcDevice,
@@ -22,7 +23,7 @@ import {
 interface LogEntry {
   id: number;
   timestamp: Date;
-  type: 'info' | 'success' | 'error' | 'command' | 'response';
+  type: 'info' | 'success' | 'error' | 'command' | 'response' | 'tx' | 'rx';
   message: string;
 }
 
@@ -49,6 +50,18 @@ function App() {
   const clearLogs = useCallback(() => {
     setLogs([]);
   }, []);
+
+  // Set up serial logging callback
+  useEffect(() => {
+    setSerialLogCallback((direction, data) => {
+      const type = direction === 'TX' ? 'tx' : direction === 'RX' ? 'rx' : 'info';
+      addLog(type, data);
+    });
+
+    return () => {
+      setSerialLogCallback(null);
+    };
+  }, [addLog]);
 
   // Connect via Web Serial
   const handleConnect = async () => {
@@ -515,20 +528,24 @@ interface LogLineProps {
 }
 
 function LogLine({ log }: LogLineProps) {
-  const colors = {
+  const colors: Record<LogEntry['type'], string> = {
     info: 'text-gray-400',
     success: 'text-green-400',
     error: 'text-red-400',
     command: 'text-yellow-400',
     response: 'text-blue-400',
+    tx: 'text-orange-400',
+    rx: 'text-cyan-400',
   };
 
-  const prefix = {
+  const prefix: Record<LogEntry['type'], string> = {
     info: '[INFO]',
     success: '[OK]',
     error: '[ERR]',
     command: '[CMD]',
     response: '[RSP]',
+    tx: '[TX →]',
+    rx: '[RX ←]',
   };
 
   const time = log.timestamp.toLocaleTimeString('en-US', {
