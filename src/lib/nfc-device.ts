@@ -1,5 +1,6 @@
 /**
  * Unified NFC Device interface that works with both WebUSB and Web Serial
+ * Protocol specific to RDR-518 NFC Reader
  */
 
 import { UsbCdcDevice, transceive as usbTransceive, toHex, fromHex } from './usb-cdc';
@@ -19,6 +20,8 @@ export interface NfcCommandResult {
   data?: Uint8Array;
   message: string;
   hexData?: string;
+  atqa?: string;
+  sak?: string;
 }
 
 /**
@@ -38,15 +41,15 @@ export async function transceive(
 }
 
 /**
- * Send APDU command and parse response
+ * Send command and parse response
  */
-export async function sendApdu(
+export async function sendCommand(
   device: NfcDevice,
-  apdu: Uint8Array,
+  command: Uint8Array,
   timeout: number = 2000
 ): Promise<NfcCommandResult> {
   try {
-    const response = await transceive(device, apdu, timeout);
+    const response = await transceive(device, command, timeout);
 
     if (response.length === 0) {
       return {
@@ -70,274 +73,73 @@ export async function sendApdu(
 }
 
 /**
- * Get card UID using GET DATA command
- * Standard APDU: FF CA 00 00 00
+ * Get card UID using RDR-518 proprietary command
+ * Command: 80 0a 01 03 00 00 02 11 03 01 01 14 00 9c f8
+ * Response format: [LEN] 01 03 00 [ATQA 2 bytes] 00 [SAK] [UID 4 bytes] [STATUS] [CRC-16 2 bytes]
+ * Example: 0b 01 03 00 05 06 00 08 8d 69 5d f1 00 e2 4e
  */
 export async function getCardUid(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF CA 00 00 00');
-  const result = await sendApdu(device, apdu);
+  const command = fromHex('80 0a 01 03 00 00 02 11 03 01 01 14 00 9c f8');
+  const result = await sendCommand(device, command);
 
-  if (result.success && result.data && result.data.length >= 2) {
-    const sw1 = result.data[result.data.length - 2];
-    const sw2 = result.data[result.data.length - 1];
+  if (result.success && result.data && result.data.length >= 13) {
+    // Parse RDR-518 response format
+    // [0] = LEN (0x0b = 11)
+    // [1-3] = Header (01 03 00)
+    // [4-5] = ATQA
+    // [6] = 00
+    // [7] = SAK
+    // [8-11] = UID (4 bytes)
+    // [12] = Status
+    // [13-14] = CRC-16
 
-    if (sw1 === 0x90 && sw2 === 0x00) {
-      const uid = result.data.subarray(0, result.data.length - 2);
+    const len = result.data[0];
+    const atqa = result.data.subarray(4, 6);
+    const sak = result.data[7];
+    const uid = result.data.subarray(8, 12);
+    const status = result.data[12];
+
+    if (status === 0x00 && len === 0x0b) {
       return {
         success: true,
         data: uid,
         hexData: toHex(uid),
-        message: `UID: ${toHex(uid)} (${uid.length * 8}-bit)`,
-      };
-    } else if (sw1 === 0x6a && sw2 === 0x81) {
-      return {
-        success: false,
-        message: 'No card present or function not supported',
+        atqa: toHex(atqa),
+        sak: sak.toString(16).padStart(2, '0').toUpperCase(),
+        message: `UID: ${toHex(uid)}`,
       };
     } else {
       return {
         success: false,
-        message: `Error: SW=${sw1.toString(16).padStart(2, '0')}${sw2.toString(16).padStart(2, '0')}`,
+        data: result.data,
+        hexData: result.hexData,
+        message: 'No card detected or read error',
       };
     }
   }
-
-  return result;
-}
-
-/**
- * Get reader firmware version
- */
-export async function getFirmwareVersion(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF 00 48 00 00');
-  const result = await sendApdu(device, apdu);
 
   if (result.success && result.data) {
-    try {
-      const text = new TextDecoder().decode(result.data);
-      if (text.length > 0 && /[\x20-\x7E]/.test(text)) {
-        result.message = `Firmware: ${text.replace(/[\x00-\x1f\x90\x00]/g, '')}`;
-      }
-    } catch {
-      // Keep hex data
-    }
+    return {
+      success: false,
+      data: result.data,
+      hexData: result.hexData,
+      message: 'No card detected',
+    };
   }
 
   return result;
 }
 
 /**
- * Get reader serial number
+ * Send custom command (hex string)
  */
-export async function getSerialNumber(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF 00 4A 00 00');
-  const result = await sendApdu(device, apdu);
-
-  if (result.success && result.data) {
-    try {
-      const text = new TextDecoder().decode(result.data);
-      if (text.length > 0) {
-        result.message = `Serial: ${text.replace(/[\x00-\x1f\x90\x00]/g, '')}`;
-      }
-    } catch {
-      // Keep hex data
-    }
-  }
-
-  return result;
-}
-
-/**
- * Get card ATS (Answer To Select)
- */
-export async function getCardAts(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF CA 01 00 00');
-  const result = await sendApdu(device, apdu);
-
-  if (result.success && result.data && result.data.length >= 2) {
-    const sw1 = result.data[result.data.length - 2];
-    const sw2 = result.data[result.data.length - 1];
-
-    if (sw1 === 0x90 && sw2 === 0x00) {
-      const ats = result.data.subarray(0, result.data.length - 2);
-      return {
-        success: true,
-        data: ats,
-        hexData: toHex(ats),
-        message: `ATS: ${toHex(ats)}`,
-      };
-    }
-  }
-
-  return {
-    success: false,
-    message: 'No ATS available',
-  };
-}
-
-/**
- * Poll for card
- */
-export async function pollCard(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF 00 00 00 04 D4 4A 01 00');
-  const result = await sendApdu(device, apdu);
-
-  if (result.success && result.data && result.data.length > 0) {
-    result.message = result.data.length > 2 ? 'Card detected' : 'No card in field';
-  }
-
-  return result;
-}
-
-/**
- * Turn antenna RF field ON
- */
-export async function antennaOn(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF 00 00 00 04 D4 32 01 01');
-  const result = await sendApdu(device, apdu);
-  result.message = result.success ? 'Antenna ON' : 'Failed to turn on antenna';
-  return result;
-}
-
-/**
- * Turn antenna RF field OFF
- */
-export async function antennaOff(device: NfcDevice): Promise<NfcCommandResult> {
-  const apdu = fromHex('FF 00 00 00 04 D4 32 01 00');
-  const result = await sendApdu(device, apdu);
-  result.message = result.success ? 'Antenna OFF' : 'Failed to turn off antenna';
-  return result;
-}
-
-/**
- * Control buzzer
- */
-export async function buzzer(device: NfcDevice, durationMs: number = 100): Promise<NfcCommandResult> {
-  const duration = Math.min(255, Math.floor(durationMs / 10));
-  const apdu = new Uint8Array([0xff, 0x00, 0x52, duration, 0x00]);
-  const result = await sendApdu(device, apdu);
-  result.message = result.success ? `Buzzer: ${duration * 10}ms` : 'Buzzer command failed';
-  return result;
-}
-
-/**
- * Control LED
- */
-export async function ledControl(
-  device: NfcDevice,
-  redOn: boolean = false,
-  greenOn: boolean = false
-): Promise<NfcCommandResult> {
-  let ledState = 0x00;
-  if (redOn) ledState |= 0x01;
-  if (greenOn) ledState |= 0x02;
-
-  const apdu = new Uint8Array([0xff, 0x00, 0x40, ledState, 0x04, 0x01, 0x01, 0x01, 0x01]);
-  const result = await sendApdu(device, apdu);
-  result.message = `LED: Red=${redOn ? 'ON' : 'OFF'}, Green=${greenOn ? 'ON' : 'OFF'}`;
-  return result;
-}
-
-/**
- * Load authentication key
- */
-export async function loadKey(
-  device: NfcDevice,
-  keyNumber: number,
-  key: Uint8Array
-): Promise<NfcCommandResult> {
-  if (key.length !== 6) {
-    return { success: false, message: 'Key must be 6 bytes' };
-  }
-
-  const apdu = new Uint8Array([0xff, 0x82, 0x00, keyNumber & 0x01, 0x06, ...key]);
-  const result = await sendApdu(device, apdu);
-
-  if (result.success && result.data && result.data.length >= 2) {
-    const sw1 = result.data[result.data.length - 2];
-    const sw2 = result.data[result.data.length - 1];
-
-    if (sw1 === 0x90 && sw2 === 0x00) {
-      result.message = `Key ${keyNumber} loaded`;
-    } else {
-      result.success = false;
-      result.message = `Load key failed: SW=${sw1.toString(16).padStart(2, '0')}${sw2.toString(16).padStart(2, '0')}`;
-    }
-  }
-
-  return result;
-}
-
-/**
- * Authenticate MIFARE Classic block
- */
-export async function authenticate(
-  device: NfcDevice,
-  blockNumber: number,
-  keyType: 'A' | 'B' = 'A',
-  keyNumber: number = 0
-): Promise<NfcCommandResult> {
-  const kt = keyType === 'A' ? 0x60 : 0x61;
-  const apdu = new Uint8Array([0xff, 0x86, 0x00, 0x00, 0x05, 0x01, 0x00, blockNumber, kt, keyNumber]);
-  const result = await sendApdu(device, apdu);
-
-  if (result.success && result.data && result.data.length >= 2) {
-    const sw1 = result.data[result.data.length - 2];
-    const sw2 = result.data[result.data.length - 1];
-
-    if (sw1 === 0x90 && sw2 === 0x00) {
-      result.message = `Authenticated block ${blockNumber} with key ${keyType}`;
-    } else {
-      result.success = false;
-      result.message = `Authentication failed: SW=${sw1.toString(16).padStart(2, '0')}${sw2.toString(16).padStart(2, '0')}`;
-    }
-  }
-
-  return result;
-}
-
-/**
- * Read MIFARE Classic block
- */
-export async function readBlock(
-  device: NfcDevice,
-  blockNumber: number,
-  length: number = 16
-): Promise<NfcCommandResult> {
-  const apdu = new Uint8Array([0xff, 0xb0, 0x00, blockNumber & 0xff, length & 0xff]);
-  const result = await sendApdu(device, apdu);
-
-  if (result.success && result.data && result.data.length >= 2) {
-    const sw1 = result.data[result.data.length - 2];
-    const sw2 = result.data[result.data.length - 1];
-
-    if (sw1 === 0x90 && sw2 === 0x00) {
-      const data = result.data.subarray(0, result.data.length - 2);
-      return {
-        success: true,
-        data: data,
-        hexData: toHex(data),
-        message: `Block ${blockNumber}: ${toHex(data)}`,
-      };
-    } else {
-      result.success = false;
-      result.message = `Read failed: SW=${sw1.toString(16).padStart(2, '0')}${sw2.toString(16).padStart(2, '0')}`;
-    }
-  }
-
-  return result;
-}
-
-/**
- * Send custom APDU command
- */
-export async function sendCustomApdu(
+export async function sendCustomCommand(
   device: NfcDevice,
   hexCommand: string
 ): Promise<NfcCommandResult> {
   try {
-    const apdu = fromHex(hexCommand);
-    return await sendApdu(device, apdu);
+    const command = fromHex(hexCommand);
+    return await sendCommand(device, command);
   } catch (error) {
     return {
       success: false,
