@@ -11,11 +11,8 @@ import {
   NfcVersionInfo,
   cardHunt,
   sendCustomCommand,
-  setLeds,
-  beepSuccess,
   getFirmwareVersion,
   endTagCommunication,
-  LED,
   toHex,
   buildHuntCommand,
 } from './lib/nfc-device';
@@ -131,7 +128,6 @@ function App() {
         if (result.comType !== undefined) {
           addLog('response', `COM Type: 0x${result.comType.toString(16).padStart(2, '0')}`);
         }
-        await beepSuccess(device);
       }
     } else {
       addLog('info', result.message);
@@ -199,7 +195,6 @@ function App() {
                 setLastSak(result.sak || '');
                 setCardStatus('');
                 addLog('success', `Card detected! UID: ${result.hexData}`);
-                await beepSuccess(device);
               }
             } else {
               // Clear display when card is removed
@@ -220,21 +215,6 @@ function App() {
       };
 
       huntLoop();
-    }
-  };
-
-  const handleLedControl = async (param: number, description: string) => {
-    if (!device) {
-      addLog('error', 'No device connected');
-      return;
-    }
-
-    addLog('command', `LED Control: ${description}`);
-    const success = await setLeds(device, param);
-    if (success) {
-      addLog('success', 'LED command sent');
-    } else {
-      addLog('error', 'LED command failed');
     }
   };
 
@@ -417,68 +397,6 @@ function App() {
           </div>
         </section>
 
-        {/* LED/Buzzer Control */}
-        <section className="bg-gray-800 rounded-lg p-6 mb-6">
-          <h2 className="text-xl font-semibold mb-4 text-blue-300">LED / Buzzer Control</h2>
-          <div className="flex flex-wrap gap-3">
-            <button
-              onClick={() => handleLedControl(LED.CPU_LED1, 'CPU LED1 (Green)')}
-              disabled={!device}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                device
-                  ? 'bg-green-600 hover:bg-green-700 text-white'
-                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              LED1 (Green)
-            </button>
-            <button
-              onClick={() => handleLedControl(LED.CPU_LED2, 'CPU LED2 (Yellow)')}
-              disabled={!device}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                device
-                  ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              LED2 (Yellow)
-            </button>
-            <button
-              onClick={() => handleLedControl(LED.CPU_LED3, 'CPU LED3 (Red)')}
-              disabled={!device}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                device
-                  ? 'bg-red-600 hover:bg-red-700 text-white'
-                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              LED3 (Red)
-            </button>
-            <button
-              onClick={() => handleLedControl(LED.ANT_BUZZER, 'Buzzer')}
-              disabled={!device}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                device
-                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              Buzzer
-            </button>
-            <button
-              onClick={() => handleLedControl(0x0000, 'All OFF')}
-              disabled={!device}
-              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                device
-                  ? 'bg-gray-700 hover:bg-gray-600 text-gray-200'
-                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-              }`}
-            >
-              All OFF
-            </button>
-          </div>
-        </section>
-
         {/* Custom Command */}
         <section className="bg-gray-800 rounded-lg p-6 mb-6">
           <h2 className="text-xl font-semibold mb-4 text-blue-300">Custom Command</h2>
@@ -503,7 +421,7 @@ function App() {
             </button>
           </div>
           <p className="text-gray-500 text-sm mt-2">
-            Enter hex bytes separated by spaces (CRC will be calculated automatically)
+            Enter complete command with CRC (e.g. 80 02 01 01 00 50 3F)
           </p>
         </section>
 

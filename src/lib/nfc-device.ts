@@ -42,7 +42,6 @@ const CLASS_SYSTEM = 0x01;
 const SYS_SOFTWARE_VERSION = 0x01;
 const SYS_ENTER_HUNT_PHASE = 0x03;
 const SYS_END_TAG_COMMUNICATION = 0x04;
-const SYS_SWITCH_SIGNALS = 0x18;
 
 // Communication Types
 export const COM_TYPE = {
@@ -52,16 +51,6 @@ export const COM_TYPE = {
   ISOA_EXTENDED: 0x05,
   MIFARE: 0x08,
   INNOVATRON: 0x10,
-} as const;
-
-// LED/Buzzer Control Constants
-export const LED = {
-  ANT_BUZZER: 0x0001,
-  ANT_LED1: 0x0002,
-  ANT_LED2: 0x0004,
-  CPU_LED1: 0x0100,
-  CPU_LED2: 0x0200,
-  CPU_LED3: 0x0400,
 } as const;
 
 /**
@@ -166,14 +155,6 @@ export function buildHuntCommand(options: {
   ]);
 
   return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_ENTER_HUNT_PHASE, data);
-}
-
-/**
- * Build LED/Buzzer control command
- */
-export function buildLedCommand(param: number): Uint8Array {
-  const data = new Uint8Array([param & 0xFF, (param >> 8) & 0xFF]);
-  return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_SWITCH_SIGNALS, data);
 }
 
 /**
@@ -386,15 +367,6 @@ export async function getCardUid(device: NfcDevice): Promise<NfcCommandResult> {
 }
 
 /**
- * Control LEDs and buzzer
- */
-export async function setLeds(device: NfcDevice, param: number): Promise<boolean> {
-  const command = buildLedCommand(param);
-  const result = await sendCommand(device, command);
-  return result.success && !!result.data && result.data.length >= 4 && result.data[3] === 0x00;
-}
-
-/**
  * Get firmware version from reader
  */
 export async function getFirmwareVersion(device: NfcDevice): Promise<{ success: boolean; version?: NfcVersionInfo; message: string; hexData?: string }> {
@@ -438,17 +410,6 @@ export async function endTagCommunication(device: NfcDevice, disconnect: boolean
   }
 
   return result;
-}
-
-/**
- * Beep and flash LED on success
- */
-export async function beepSuccess(device: NfcDevice): Promise<void> {
-  await setLeds(device, LED.CPU_LED1 | LED.ANT_BUZZER);
-  await new Promise(resolve => setTimeout(resolve, 100));
-  await setLeds(device, LED.CPU_LED1);
-  await new Promise(resolve => setTimeout(resolve, 100));
-  await setLeds(device, 0x0000);
 }
 
 /**
