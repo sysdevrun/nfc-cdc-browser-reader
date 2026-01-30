@@ -1,5 +1,7 @@
 # NFC CDC Browser Reader
 
+**Live Demo:** https://sysdevrun.github.io/nfc-cdc-browser-reader/
+
 A web-based NFC reader interface that uses WebUSB to communicate with ACS ACR518 (ACR1281S-C1) and compatible NFC readers configured in CDC (serial) mode.
 
 ## Features
