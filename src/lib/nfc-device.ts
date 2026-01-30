@@ -113,40 +113,46 @@ export function buildCommand(
 /**
  * Build card hunt (Enter Hunt Phase) command
  * Based on working command: 80 0A 01 03 00 00 02 11 03 01 01 14 00 9C F8
+ *
+ * This is CSC_SearchCardExt with extended parameters for ISO-A and MIFARE detection.
  */
 export function buildHuntCommand(options: {
   isoa?: boolean;
   isob?: boolean;
+  mifare?: boolean;
   forget?: boolean;
   timeout10ms?: number;
+  antenna?: number;
 } = {}): Uint8Array {
   const {
     isoa = true,
     isob = false,
+    mifare = true,
     forget = true,
     timeout10ms = 0x14, // 200ms default
+    antenna = 2,        // Antenna number (1-4)
   } = options;
 
-  // Data structure based on working command analysis:
-  // Byte 0: CONT (contact mode)
-  // Byte 1: ISOB (ISO 14443-B antenna)
-  // Byte 2: ISOA (ISO 14443-A antenna) - use 0x02 for antenna 2
-  // Byte 3: TICK (ticket mode) - 0x11 in working command
-  // Byte 4: INNO (Innovatron) - 0x03 in working command
-  // Byte 5: FORGET (forget last card)
-  // Byte 6: Unknown parameter - 0x01 in working command
-  // Byte 7: TIMEOUT (x10ms)
-  // Byte 8: RFU
+  // Data structure (CSC_SearchCardExt - 9 bytes):
+  // Byte 0: CONT    - Contact mode (0x00 = disabled)
+  // Byte 1: ISOB    - ISO 14443-B (0x00 = disabled, 0x01-0x04 = antenna number)
+  // Byte 2: ISOA    - ISO 14443-A (0x00 = disabled, 0x01-0x04 = antenna number)
+  // Byte 3: CONFIG  - Protocol config (0x11 = ISO-A + extended ATR mode)
+  // Byte 4: MIFARE  - MIFARE detection (0x00 = disabled, 0x03 = enabled)
+  // Byte 5: FLAGS   - Search flags (0x01 = additional flags)
+  // Byte 6: FORGET  - Forget previous card (0x00 = remember, 0x01 = forget)
+  // Byte 7: TIMEOUT - Search timeout (value × 10ms)
+  // Byte 8: RFU     - Reserved (0x00)
   const data = new Uint8Array([
-    0x00,                           // CONT: disabled
-    isob ? 0x02 : 0x00,             // ISOB: antenna 2 or disabled
-    isoa ? 0x02 : 0x00,             // ISOA: antenna 2 (not 0x01!)
-    0x11,                           // TICK: 0x11 (required for card detection)
-    0x03,                           // INNO: 0x03 (required for card detection)
-    forget ? 0x01 : 0x00,           // FORGET
-    0x01,                           // Unknown param (0x01 in working command)
-    timeout10ms,                    // TIMEOUT
-    0x00,                           // RFU
+    0x00,                               // CONT: disabled
+    isob ? antenna : 0x00,              // ISOB: antenna number or disabled
+    isoa ? antenna : 0x00,              // ISOA: antenna number or disabled
+    0x11,                               // CONFIG: 0x11 (ISO-A + extended ATR)
+    mifare ? 0x03 : 0x00,               // MIFARE: 0x03 = enabled
+    0x01,                               // FLAGS: 0x01 (search flags)
+    forget ? 0x01 : 0x00,               // FORGET: forget previous card
+    timeout10ms,                        // TIMEOUT: x10ms
+    0x00,                               // RFU: reserved
   ]);
 
   return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_ENTER_HUNT_PHASE, data);
@@ -341,8 +347,10 @@ export async function cardHunt(
   options: {
     isoa?: boolean;
     isob?: boolean;
+    mifare?: boolean;
     forget?: boolean;
     timeout10ms?: number;
+    antenna?: number;
   } = {}
 ): Promise<NfcCommandResult> {
   const command = buildHuntCommand(options);

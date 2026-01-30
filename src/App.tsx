@@ -8,7 +8,6 @@ import {
 import {
   NfcDevice,
   NfcVersionInfo,
-  getCardUid,
   cardHunt,
   sendCustomCommand,
   setLeds,
@@ -31,16 +30,11 @@ function App() {
   const [device, setDevice] = useState<NfcDevice | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [customCommand, setCustomCommand] = useState<string>('');
-  const [isPolling, setIsPolling] = useState<boolean>(false);
   const [isHunting, setIsHunting] = useState<boolean>(false);
   const [lastUid, setLastUid] = useState<string>('');
   const [lastAtqa, setLastAtqa] = useState<string>('');
   const [lastSak, setLastSak] = useState<string>('');
-  const [huntTimeout, setHuntTimeout] = useState<number>(68); // 680ms in 10ms units
-  const [huntIsoA, setHuntIsoA] = useState<boolean>(true);
-  const [huntIsoB, setHuntIsoB] = useState<boolean>(false);
   const [firmwareInfo, setFirmwareInfo] = useState<NfcVersionInfo | null>(null);
-  const pollingRef = useRef<boolean>(false);
   const huntingRef = useRef<boolean>(false);
 
   const addLog = useCallback((type: LogEntry['type'], message: string) => {
@@ -82,9 +76,7 @@ function App() {
 
   const handleDisconnect = async () => {
     if (device) {
-      pollingRef.current = false;
       huntingRef.current = false;
-      setIsPolling(false);
       setIsHunting(false);
 
       if (device.serialDevice) {
@@ -100,35 +92,6 @@ function App() {
     }
   };
 
-  const handleGetUid = async () => {
-    if (!device) {
-      addLog('error', 'No device connected');
-      return;
-    }
-
-    addLog('command', 'Reading card UID...');
-    const result = await getCardUid(device);
-
-    if (result.success) {
-      addLog('success', result.message);
-      if (result.hexData) {
-        setLastUid(result.hexData);
-        setLastAtqa(result.atqa || '');
-        setLastSak(result.sak || '');
-        addLog('response', `UID: ${result.hexData}`);
-        if (result.atqa) addLog('response', `ATQA: ${result.atqa}`);
-        if (result.sak) addLog('response', `SAK: ${result.sak}`);
-        // Beep on success
-        await beepSuccess(device);
-      }
-    } else {
-      addLog('error', result.message);
-      if (result.hexData) {
-        addLog('response', `Raw: ${result.hexData}`);
-      }
-    }
-  };
-
   const handleCardHunt = async () => {
     if (!device) {
       addLog('error', 'No device connected');
@@ -136,20 +99,10 @@ function App() {
     }
 
     // Show the command being sent
-    const command = buildHuntCommand({
-      isoa: huntIsoA,
-      isob: huntIsoB,
-      forget: true,
-      timeout10ms: huntTimeout,
-    });
+    const command = buildHuntCommand();
     addLog('command', `Card Hunt: ${toHex(command)}`);
 
-    const result = await cardHunt(device, {
-      isoa: huntIsoA,
-      isob: huntIsoB,
-      forget: true,
-      timeout10ms: huntTimeout,
-    });
+    const result = await cardHunt(device);
 
     if (result.success) {
       addLog('success', result.message);
@@ -197,51 +150,6 @@ function App() {
     }
   };
 
-  const togglePolling = async () => {
-    if (!device) {
-      addLog('error', 'No device connected');
-      return;
-    }
-
-    if (isPolling) {
-      pollingRef.current = false;
-      setIsPolling(false);
-      addLog('info', 'Stopped continuous polling');
-    } else {
-      pollingRef.current = true;
-      setIsPolling(true);
-      addLog('info', 'Started continuous polling (every 500ms)');
-
-      let lastDetectedUid = '';
-
-      const pollLoop = async () => {
-        while (pollingRef.current && device) {
-          try {
-            const result = await getCardUid(device);
-            if (result.success && result.hexData) {
-              if (result.hexData !== lastDetectedUid) {
-                lastDetectedUid = result.hexData;
-                setLastUid(result.hexData);
-                setLastAtqa(result.atqa || '');
-                setLastSak(result.sak || '');
-                addLog('success', `Card detected! UID: ${result.hexData}`);
-                await beepSuccess(device);
-              }
-            } else {
-              lastDetectedUid = '';
-            }
-          } catch {
-            // Ignore polling errors
-          }
-
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-      };
-
-      pollLoop();
-    }
-  };
-
   const toggleHunting = async () => {
     if (!device) {
       addLog('error', 'No device connected');
@@ -255,26 +163,21 @@ function App() {
     } else {
       huntingRef.current = true;
       setIsHunting(true);
-      addLog('info', `Started continuous card hunt (timeout: ${huntTimeout * 10}ms)`);
+      addLog('info', 'Started continuous card hunt');
 
       let lastDetectedUid = '';
 
       const huntLoop = async () => {
         while (huntingRef.current && device) {
           try {
-            const result = await cardHunt(device, {
-              isoa: huntIsoA,
-              isob: huntIsoB,
-              forget: true,
-              timeout10ms: huntTimeout,
-            });
+            const result = await cardHunt(device);
             if (result.success && result.hexData) {
               if (result.hexData !== lastDetectedUid) {
                 lastDetectedUid = result.hexData;
                 setLastUid(result.hexData);
                 setLastAtqa(result.atqa || '');
                 setLastSak(result.sak || '');
-                addLog('success', `Card hunted! UID: ${result.hexData}`);
+                addLog('success', `Card detected! UID: ${result.hexData}`);
                 await beepSuccess(device);
               }
             } else {
@@ -442,41 +345,7 @@ function App() {
         <section className="bg-gray-800 rounded-lg p-6 mb-6">
           <h2 className="text-xl font-semibold mb-4 text-blue-300">Card Hunt</h2>
 
-          {/* Hunt Options */}
-          <div className="flex flex-wrap gap-4 mb-4">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={huntIsoA}
-                onChange={(e) => setHuntIsoA(e.target.checked)}
-                className="w-4 h-4"
-              />
-              <span>ISO 14443-A</span>
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={huntIsoB}
-                onChange={(e) => setHuntIsoB(e.target.checked)}
-                className="w-4 h-4"
-              />
-              <span>ISO 14443-B</span>
-            </label>
-            <label className="flex items-center gap-2">
-              <span>Timeout:</span>
-              <input
-                type="number"
-                value={huntTimeout}
-                onChange={(e) => setHuntTimeout(Math.max(1, Math.min(255, parseInt(e.target.value) || 1)))}
-                className="w-20 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-center"
-                min="1"
-                max="255"
-              />
-              <span className="text-gray-400 text-sm">x10ms ({huntTimeout * 10}ms)</span>
-            </label>
-          </div>
-
-          <div className="flex flex-wrap gap-3 mb-6">
+          <div className="flex flex-wrap gap-3 mb-4">
             <button
               onClick={handleCardHunt}
               disabled={!device || isHunting}
@@ -501,48 +370,17 @@ function App() {
             >
               {isHunting ? 'Stop Hunt' : 'Continuous Hunt'}
             </button>
-          </div>
-
-          {/* Quick Actions */}
-          <div className="border-t border-gray-700 pt-4">
-            <h3 className="text-lg font-medium mb-3 text-gray-300">Quick Actions</h3>
-            <div className="flex flex-wrap gap-3">
-              <button
-                onClick={handleGetUid}
-                disabled={!device}
-                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                  device
-                    ? 'bg-green-600 hover:bg-green-700 text-white'
-                    : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-                }`}
-              >
-                Get UID
-              </button>
-              <button
-                onClick={togglePolling}
-                disabled={!device}
-                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                  !device
-                    ? 'bg-gray-800 text-gray-500 cursor-not-allowed'
-                    : isPolling
-                    ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
-                }`}
-              >
-                {isPolling ? 'Stop Poll' : 'Auto Poll'}
-              </button>
-              <button
-                onClick={() => handleEndTag(true)}
-                disabled={!device}
-                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                  device
-                    ? 'bg-red-700 hover:bg-red-600 text-white'
-                    : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-                }`}
-              >
-                End Tag
-              </button>
-            </div>
+            <button
+              onClick={() => handleEndTag(true)}
+              disabled={!device}
+              className={`px-6 py-3 rounded-lg font-medium transition-colors ${
+                device
+                  ? 'bg-red-700 hover:bg-red-600 text-white'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              End Tag
+            </button>
           </div>
         </section>
 
@@ -616,7 +454,7 @@ function App() {
               type="text"
               value={customCommand}
               onChange={(e) => setCustomCommand(e.target.value.toUpperCase())}
-              placeholder="80 0A 01 03 00 00 01 00 00 01 44 00"
+              placeholder="80 0B 01 03 00 00 02 11 03 01 01 14 00"
               className="flex-1 min-w-64 bg-gray-700 border border-gray-600 rounded px-3 py-2 font-mono text-white text-sm"
             />
             <button
@@ -632,7 +470,7 @@ function App() {
             </button>
           </div>
           <p className="text-gray-500 text-sm mt-2">
-            Enter hex bytes separated by spaces (CRC will be calculated if not included)
+            Enter hex bytes separated by spaces (CRC will be calculated automatically)
           </p>
         </section>
 
