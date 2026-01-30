@@ -112,6 +112,7 @@ export function buildCommand(
 
 /**
  * Build card hunt (Enter Hunt Phase) command
+ * Based on working command: 80 0A 01 03 00 00 02 11 03 01 01 14 00 9C F8
  */
 export function buildHuntCommand(options: {
   isoa?: boolean;
@@ -123,16 +124,27 @@ export function buildHuntCommand(options: {
     isoa = true,
     isob = false,
     forget = true,
-    timeout10ms = 0x44, // 680ms default
+    timeout10ms = 0x14, // 200ms default
   } = options;
 
+  // Data structure based on working command analysis:
+  // Byte 0: CONT (contact mode)
+  // Byte 1: ISOB (ISO 14443-B antenna)
+  // Byte 2: ISOA (ISO 14443-A antenna) - use 0x02 for antenna 2
+  // Byte 3: TICK (ticket mode) - 0x11 in working command
+  // Byte 4: INNO (Innovatron) - 0x03 in working command
+  // Byte 5: FORGET (forget last card)
+  // Byte 6: Unknown parameter - 0x01 in working command
+  // Byte 7: TIMEOUT (x10ms)
+  // Byte 8: RFU
   const data = new Uint8Array([
     0x00,                           // CONT: disabled
     isob ? 0x02 : 0x00,             // ISOB: antenna 2 or disabled
-    isoa ? 0x01 : 0x00,             // ISOA: antenna 1 or disabled
-    0x00,                           // TICK: disabled
-    0x00,                           // INNO: disabled
+    isoa ? 0x02 : 0x00,             // ISOA: antenna 2 (not 0x01!)
+    0x11,                           // TICK: 0x11 (required for card detection)
+    0x03,                           // INNO: 0x03 (required for card detection)
     forget ? 0x01 : 0x00,           // FORGET
+    0x01,                           // Unknown param (0x01 in working command)
     timeout10ms,                    // TIMEOUT
     0x00,                           // RFU
   ]);
