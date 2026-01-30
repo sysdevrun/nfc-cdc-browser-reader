@@ -6,15 +6,15 @@ import {
   getSerialPortInfo,
 } from './lib/web-serial';
 import {
-  isWebUsbSupported,
-  requestDevice as requestUsbDevice,
-  disconnectDevice as disconnectUsbDevice,
-  getDeviceInfo,
-} from './lib/usb-cdc';
-import {
   NfcDevice,
   getCardUid,
+  cardHunt,
   sendCustomCommand,
+  setLeds,
+  beepSuccess,
+  LED,
+  toHex,
+  buildHuntCommand,
 } from './lib/nfc-device';
 
 interface LogEntry {
@@ -27,12 +27,17 @@ interface LogEntry {
 function App() {
   const [device, setDevice] = useState<NfcDevice | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [customCommand, setCustomCommand] = useState<string>('80 0a 01 03 00 00 02 11 03 01 01 14 00 9c f8');
+  const [customCommand, setCustomCommand] = useState<string>('');
   const [isPolling, setIsPolling] = useState<boolean>(false);
+  const [isHunting, setIsHunting] = useState<boolean>(false);
   const [lastUid, setLastUid] = useState<string>('');
   const [lastAtqa, setLastAtqa] = useState<string>('');
   const [lastSak, setLastSak] = useState<string>('');
+  const [huntTimeout, setHuntTimeout] = useState<number>(68); // 680ms in 10ms units
+  const [huntIsoA, setHuntIsoA] = useState<boolean>(true);
+  const [huntIsoB, setHuntIsoB] = useState<boolean>(false);
   const pollingRef = useRef<boolean>(false);
+  const huntingRef = useRef<boolean>(false);
 
   const addLog = useCallback((type: LogEntry['type'], message: string) => {
     setLogs(prev => [...prev, {
@@ -47,8 +52,8 @@ function App() {
     setLogs([]);
   }, []);
 
-  // Connect via Web Serial (preferred for Windows)
-  const handleConnectSerial = async () => {
+  // Connect via Web Serial
+  const handleConnect = async () => {
     if (!isWebSerialSupported()) {
       addLog('error', 'Web Serial API is not supported. Please use Chrome or Edge.');
       return;
@@ -65,32 +70,7 @@ function App() {
         serialDevice: result.device,
       };
       setDevice(nfcDevice);
-      addLog('success', `Connected via Serial: ${name}`);
-    } else {
-      addLog('error', result.error || 'Failed to connect');
-    }
-  };
-
-  // Connect via WebUSB (fallback)
-  const handleConnectUsb = async () => {
-    if (!isWebUsbSupported()) {
-      addLog('error', 'WebUSB is not supported. Please use Chrome, Edge, or Opera.');
-      return;
-    }
-
-    addLog('info', 'Requesting USB device...');
-    const result = await requestUsbDevice();
-
-    if (result.success && result.device) {
-      const name = getDeviceInfo(result.device.device);
-      const nfcDevice: NfcDevice = {
-        type: 'usb',
-        name,
-        usbDevice: result.device,
-      };
-      setDevice(nfcDevice);
-      addLog('success', `Connected via USB: ${name}`);
-      addLog('info', `Interface: ${result.device.interfaceNumber}, EP In: ${result.device.endpointIn}, EP Out: ${result.device.endpointOut}`);
+      addLog('success', `Connected: ${name}`);
     } else {
       addLog('error', result.error || 'Failed to connect');
     }
@@ -99,12 +79,12 @@ function App() {
   const handleDisconnect = async () => {
     if (device) {
       pollingRef.current = false;
+      huntingRef.current = false;
       setIsPolling(false);
+      setIsHunting(false);
 
-      if (device.type === 'serial' && device.serialDevice) {
+      if (device.serialDevice) {
         await disconnectSerialPort(device.serialDevice);
-      } else if (device.type === 'usb' && device.usbDevice) {
-        await disconnectUsbDevice(device.usbDevice);
       }
 
       setDevice(null);
@@ -133,9 +113,55 @@ function App() {
         addLog('response', `UID: ${result.hexData}`);
         if (result.atqa) addLog('response', `ATQA: ${result.atqa}`);
         if (result.sak) addLog('response', `SAK: ${result.sak}`);
+        // Beep on success
+        await beepSuccess(device);
       }
     } else {
       addLog('error', result.message);
+      if (result.hexData) {
+        addLog('response', `Raw: ${result.hexData}`);
+      }
+    }
+  };
+
+  const handleCardHunt = async () => {
+    if (!device) {
+      addLog('error', 'No device connected');
+      return;
+    }
+
+    // Show the command being sent
+    const command = buildHuntCommand({
+      isoa: huntIsoA,
+      isob: huntIsoB,
+      forget: true,
+      timeout10ms: huntTimeout,
+    });
+    addLog('command', `Card Hunt: ${toHex(command)}`);
+
+    const result = await cardHunt(device, {
+      isoa: huntIsoA,
+      isob: huntIsoB,
+      forget: true,
+      timeout10ms: huntTimeout,
+    });
+
+    if (result.success) {
+      addLog('success', result.message);
+      if (result.hexData) {
+        setLastUid(result.hexData);
+        setLastAtqa(result.atqa || '');
+        setLastSak(result.sak || '');
+        addLog('response', `UID: ${result.hexData}`);
+        if (result.atqa) addLog('response', `ATQA: ${result.atqa}`);
+        if (result.sak) addLog('response', `SAK: ${result.sak}`);
+        if (result.comType !== undefined) {
+          addLog('response', `COM Type: 0x${result.comType.toString(16).padStart(2, '0')}`);
+        }
+        await beepSuccess(device);
+      }
+    } else {
+      addLog('info', result.message);
       if (result.hexData) {
         addLog('response', `Raw: ${result.hexData}`);
       }
@@ -194,6 +220,7 @@ function App() {
                 setLastAtqa(result.atqa || '');
                 setLastSak(result.sak || '');
                 addLog('success', `Card detected! UID: ${result.hexData}`);
+                await beepSuccess(device);
               }
             } else {
               lastDetectedUid = '';
@@ -210,24 +237,88 @@ function App() {
     }
   };
 
+  const toggleHunting = async () => {
+    if (!device) {
+      addLog('error', 'No device connected');
+      return;
+    }
+
+    if (isHunting) {
+      huntingRef.current = false;
+      setIsHunting(false);
+      addLog('info', 'Stopped continuous card hunt');
+    } else {
+      huntingRef.current = true;
+      setIsHunting(true);
+      addLog('info', `Started continuous card hunt (timeout: ${huntTimeout * 10}ms)`);
+
+      let lastDetectedUid = '';
+
+      const huntLoop = async () => {
+        while (huntingRef.current && device) {
+          try {
+            const result = await cardHunt(device, {
+              isoa: huntIsoA,
+              isob: huntIsoB,
+              forget: true,
+              timeout10ms: huntTimeout,
+            });
+            if (result.success && result.hexData) {
+              if (result.hexData !== lastDetectedUid) {
+                lastDetectedUid = result.hexData;
+                setLastUid(result.hexData);
+                setLastAtqa(result.atqa || '');
+                setLastSak(result.sak || '');
+                addLog('success', `Card hunted! UID: ${result.hexData}`);
+                await beepSuccess(device);
+              }
+            } else {
+              lastDetectedUid = '';
+            }
+          } catch {
+            // Ignore hunt errors
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      };
+
+      huntLoop();
+    }
+  };
+
+  const handleLedControl = async (param: number, description: string) => {
+    if (!device) {
+      addLog('error', 'No device connected');
+      return;
+    }
+
+    addLog('command', `LED Control: ${description}`);
+    const success = await setLeds(device, param);
+    if (success) {
+      addLog('success', 'LED command sent');
+    } else {
+      addLog('error', 'LED command failed');
+    }
+  };
+
   const serialSupported = isWebSerialSupported();
-  const usbSupported = isWebUsbSupported();
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-4">
       <div className="max-w-4xl mx-auto">
         <header className="mb-8">
-          <h1 className="text-3xl font-bold text-blue-400 mb-2">NFC CDC Browser Reader</h1>
+          <h1 className="text-3xl font-bold text-blue-400 mb-2">NFC Card Hunt Reader</h1>
           <p className="text-gray-400">
-            Web interface for RDR-518 NFC reader in CDC/Serial mode
+            ASK CSC Protocol interface for RDR-518 NFC reader
           </p>
         </header>
 
-        {!serialSupported && !usbSupported && (
+        {!serialSupported && (
           <div className="bg-red-900/50 border border-red-500 rounded-lg p-4 mb-6">
             <h2 className="text-red-400 font-semibold mb-2">Not Supported</h2>
             <p className="text-gray-300">
-              Your browser does not support Web Serial or WebUSB. Please use Chrome or Edge.
+              Your browser does not support Web Serial. Please use Chrome or Edge.
             </p>
           </div>
         )}
@@ -237,31 +328,18 @@ function App() {
           <h2 className="text-xl font-semibold mb-4 text-blue-300">Device Connection</h2>
           <div className="flex flex-wrap items-center gap-4">
             {!device ? (
-              <>
-                <button
-                  onClick={handleConnectSerial}
-                  disabled={!serialSupported}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-2 rounded-lg font-medium transition-colors"
-                >
-                  Connect (Serial)
-                </button>
-                <button
-                  onClick={handleConnectUsb}
-                  disabled={!usbSupported}
-                  className="bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 disabled:cursor-not-allowed px-6 py-2 rounded-lg font-medium transition-colors"
-                >
-                  Connect (USB)
-                </button>
-                <span className="text-gray-500 text-sm">
-                  {serialSupported ? '← Recommended for Windows' : ''}
-                </span>
-              </>
+              <button
+                onClick={handleConnect}
+                disabled={!serialSupported}
+                className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-2 rounded-lg font-medium transition-colors"
+              >
+                Connect
+              </button>
             ) : (
               <>
                 <div className="flex items-center gap-2">
                   <span className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></span>
                   <span className="text-green-400 font-medium">{device.name}</span>
-                  <span className="text-gray-500 text-sm">({device.type})</span>
                 </div>
                 <button
                   onClick={handleDisconnect}
@@ -288,64 +366,191 @@ function App() {
           </section>
         )}
 
-        {/* Commands Section */}
+        {/* Card Hunt Section */}
         <section className="bg-gray-800 rounded-lg p-6 mb-6">
-          <h2 className="text-xl font-semibold mb-4 text-blue-300">Commands</h2>
+          <h2 className="text-xl font-semibold mb-4 text-blue-300">Card Hunt</h2>
+
+          {/* Hunt Options */}
+          <div className="flex flex-wrap gap-4 mb-4">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={huntIsoA}
+                onChange={(e) => setHuntIsoA(e.target.checked)}
+                className="w-4 h-4"
+              />
+              <span>ISO 14443-A</span>
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={huntIsoB}
+                onChange={(e) => setHuntIsoB(e.target.checked)}
+                className="w-4 h-4"
+              />
+              <span>ISO 14443-B</span>
+            </label>
+            <label className="flex items-center gap-2">
+              <span>Timeout:</span>
+              <input
+                type="number"
+                value={huntTimeout}
+                onChange={(e) => setHuntTimeout(Math.max(1, Math.min(255, parseInt(e.target.value) || 1)))}
+                className="w-20 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-center"
+                min="1"
+                max="255"
+              />
+              <span className="text-gray-400 text-sm">x10ms ({huntTimeout * 10}ms)</span>
+            </label>
+          </div>
 
           <div className="flex flex-wrap gap-3 mb-6">
             <button
-              onClick={handleGetUid}
-              disabled={!device}
+              onClick={handleCardHunt}
+              disabled={!device || isHunting}
               className={`px-6 py-3 rounded-lg font-medium transition-colors text-lg ${
+                device && !isHunting
+                  ? 'bg-purple-600 hover:bg-purple-700 text-white'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              Hunt Once
+            </button>
+            <button
+              onClick={toggleHunting}
+              disabled={!device}
+              className={`px-6 py-3 rounded-lg font-medium transition-colors ${
+                !device
+                  ? 'bg-gray-800 text-gray-500 cursor-not-allowed'
+                  : isHunting
+                  ? 'bg-orange-600 hover:bg-orange-700 text-white'
+                  : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+              }`}
+            >
+              {isHunting ? 'Stop Hunt' : 'Continuous Hunt'}
+            </button>
+          </div>
+
+          {/* Quick Actions */}
+          <div className="border-t border-gray-700 pt-4">
+            <h3 className="text-lg font-medium mb-3 text-gray-300">Quick Actions</h3>
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={handleGetUid}
+                disabled={!device}
+                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                  device
+                    ? 'bg-green-600 hover:bg-green-700 text-white'
+                    : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+                }`}
+              >
+                Get UID
+              </button>
+              <button
+                onClick={togglePolling}
+                disabled={!device}
+                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                  !device
+                    ? 'bg-gray-800 text-gray-500 cursor-not-allowed'
+                    : isPolling
+                    ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
+                    : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                }`}
+              >
+                {isPolling ? 'Stop Poll' : 'Auto Poll'}
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* LED/Buzzer Control */}
+        <section className="bg-gray-800 rounded-lg p-6 mb-6">
+          <h2 className="text-xl font-semibold mb-4 text-blue-300">LED / Buzzer Control</h2>
+          <div className="flex flex-wrap gap-3">
+            <button
+              onClick={() => handleLedControl(LED.CPU_LED1, 'CPU LED1 (Green)')}
+              disabled={!device}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
                 device
                   ? 'bg-green-600 hover:bg-green-700 text-white'
                   : 'bg-gray-800 text-gray-500 cursor-not-allowed'
               }`}
             >
-              Get UID
+              LED1 (Green)
             </button>
             <button
-              onClick={togglePolling}
+              onClick={() => handleLedControl(LED.CPU_LED2, 'CPU LED2 (Yellow)')}
               disabled={!device}
-              className={`px-6 py-3 rounded-lg font-medium transition-colors ${
-                !device
-                  ? 'bg-gray-800 text-gray-500 cursor-not-allowed'
-                  : isPolling
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                device
                   ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
               }`}
             >
-              {isPolling ? 'Stop Polling' : 'Auto Poll'}
+              LED2 (Yellow)
+            </button>
+            <button
+              onClick={() => handleLedControl(LED.CPU_LED3, 'CPU LED3 (Red)')}
+              disabled={!device}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                device
+                  ? 'bg-red-600 hover:bg-red-700 text-white'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              LED3 (Red)
+            </button>
+            <button
+              onClick={() => handleLedControl(LED.ANT_BUZZER, 'Buzzer')}
+              disabled={!device}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                device
+                  ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              Buzzer
+            </button>
+            <button
+              onClick={() => handleLedControl(0x0000, 'All OFF')}
+              disabled={!device}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                device
+                  ? 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              All OFF
             </button>
           </div>
+        </section>
 
-          {/* Custom Command */}
-          <div className="border-t border-gray-700 pt-4 mt-4">
-            <h3 className="text-lg font-medium mb-3 text-gray-300">Custom Command</h3>
-            <div className="flex flex-wrap items-center gap-3">
-              <input
-                type="text"
-                value={customCommand}
-                onChange={(e) => setCustomCommand(e.target.value.toUpperCase())}
-                placeholder="80 0a 01 03 00 00 02 11 03 01 01 14 00 9c f8"
-                className="flex-1 min-w-64 bg-gray-700 border border-gray-600 rounded px-3 py-2 font-mono text-white text-sm"
-              />
-              <button
-                onClick={handleCustomCommand}
-                disabled={!device}
-                className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-                  device
-                    ? 'bg-gray-700 hover:bg-gray-600 text-gray-200'
-                    : 'bg-gray-800 text-gray-500 cursor-not-allowed'
-                }`}
-              >
-                Send
-              </button>
-            </div>
-            <p className="text-gray-500 text-sm mt-2">
-              Enter hex bytes separated by spaces
-            </p>
+        {/* Custom Command */}
+        <section className="bg-gray-800 rounded-lg p-6 mb-6">
+          <h2 className="text-xl font-semibold mb-4 text-blue-300">Custom Command</h2>
+          <div className="flex flex-wrap items-center gap-3">
+            <input
+              type="text"
+              value={customCommand}
+              onChange={(e) => setCustomCommand(e.target.value.toUpperCase())}
+              placeholder="80 0A 01 03 00 00 01 00 00 01 44 00"
+              className="flex-1 min-w-64 bg-gray-700 border border-gray-600 rounded px-3 py-2 font-mono text-white text-sm"
+            />
+            <button
+              onClick={handleCustomCommand}
+              disabled={!device || !customCommand.trim()}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors ${
+                device && customCommand.trim()
+                  ? 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  : 'bg-gray-800 text-gray-500 cursor-not-allowed'
+              }`}
+            >
+              Send
+            </button>
           </div>
+          <p className="text-gray-500 text-sm mt-2">
+            Enter hex bytes separated by spaces (CRC will be calculated if not included)
+          </p>
         </section>
 
         {/* Log Output */}
@@ -373,7 +578,7 @@ function App() {
         {/* Footer */}
         <footer className="mt-8 text-center text-gray-500 text-sm">
           <p>
-            NFC CDC Browser Reader - Uses Web Serial / WebUSB to communicate with NFC readers
+            NFC Card Hunt Reader - ASK CSC Protocol via Web Serial
           </p>
           <p className="mt-1">
             Tested with RDR-518
