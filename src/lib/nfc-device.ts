@@ -1,18 +1,14 @@
 /**
- * Unified NFC Device interface that works with both WebUSB and Web Serial
- * Protocol specific to RDR-518 NFC Reader
+ * NFC Device interface using Web Serial
+ * Protocol specific to ASK CSC (RDR-518) NFC Reader
  */
 
-import { UsbCdcDevice, transceive as usbTransceive, toHex, fromHex } from './usb-cdc';
 import { SerialDevice, transceiveSerial } from './web-serial';
 
-export type ConnectionType = 'usb' | 'serial';
-
 export interface NfcDevice {
-  type: ConnectionType;
+  type: 'serial';
   name: string;
-  usbDevice?: UsbCdcDevice;
-  serialDevice?: SerialDevice;
+  serialDevice: SerialDevice;
 }
 
 export interface NfcCommandResult {
@@ -22,6 +18,200 @@ export interface NfcCommandResult {
   hexData?: string;
   atqa?: string;
   sak?: string;
+  comType?: number;
+}
+
+// ASK CSC Protocol Constants
+const CMD_EXECUTE = 0x80;
+
+// Function Classes
+const CLASS_SYSTEM = 0x01;
+
+// System Commands
+const SYS_ENTER_HUNT_PHASE = 0x03;
+const SYS_SWITCH_SIGNALS = 0x18;
+
+// Communication Types
+export const COM_TYPE = {
+  CONTACT: 0x01,
+  ISOB: 0x02,
+  ISOA: 0x04,
+  ISOA_EXTENDED: 0x05,
+  MIFARE: 0x08,
+  INNOVATRON: 0x10,
+} as const;
+
+// LED/Buzzer Control Constants
+export const LED = {
+  ANT_BUZZER: 0x0001,
+  ANT_LED1: 0x0002,
+  ANT_LED2: 0x0004,
+  CPU_LED1: 0x0100,
+  CPU_LED2: 0x0200,
+  CPU_LED3: 0x0400,
+} as const;
+
+/**
+ * Calculate CRC-16 CCITT checksum
+ * Polynomial: 0x1021, Initial: 0xFFFF, No reflection
+ */
+export function crc16Ccitt(data: Uint8Array): number {
+  let crc = 0xFFFF;
+  for (const byte of data) {
+    crc ^= byte << 8;
+    for (let i = 0; i < 8; i++) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ 0x1021;
+      } else {
+        crc <<= 1;
+      }
+      crc &= 0xFFFF;
+    }
+  }
+  return crc;
+}
+
+/**
+ * Build a complete command frame with CRC
+ */
+export function buildCommand(
+  cmd: number,
+  classId: number,
+  ident: number,
+  data: Uint8Array = new Uint8Array(0)
+): Uint8Array {
+  const length = 2 + data.length; // CLASS + IDENT + DATA
+  const frame = new Uint8Array(4 + data.length);
+  frame[0] = cmd;
+  frame[1] = length;
+  frame[2] = classId;
+  frame[3] = ident;
+  frame.set(data, 4);
+
+  const crc = crc16Ccitt(frame);
+  const result = new Uint8Array(frame.length + 2);
+  result.set(frame);
+  result[frame.length] = crc & 0xFF; // Low byte
+  result[frame.length + 1] = (crc >> 8) & 0xFF; // High byte
+
+  return result;
+}
+
+/**
+ * Build card hunt (Enter Hunt Phase) command
+ */
+export function buildHuntCommand(options: {
+  isoa?: boolean;
+  isob?: boolean;
+  forget?: boolean;
+  timeout10ms?: number;
+} = {}): Uint8Array {
+  const {
+    isoa = true,
+    isob = false,
+    forget = true,
+    timeout10ms = 0x44, // 680ms default
+  } = options;
+
+  const data = new Uint8Array([
+    0x00,                           // CONT: disabled
+    isob ? 0x02 : 0x00,             // ISOB: antenna 2 or disabled
+    isoa ? 0x01 : 0x00,             // ISOA: antenna 1 or disabled
+    0x00,                           // TICK: disabled
+    0x00,                           // INNO: disabled
+    forget ? 0x01 : 0x00,           // FORGET
+    timeout10ms,                    // TIMEOUT
+    0x00,                           // RFU
+  ]);
+
+  return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_ENTER_HUNT_PHASE, data);
+}
+
+/**
+ * Build LED/Buzzer control command
+ */
+export function buildLedCommand(param: number): Uint8Array {
+  const data = new Uint8Array([param & 0xFF, (param >> 8) & 0xFF]);
+  return buildCommand(CMD_EXECUTE, CLASS_SYSTEM, SYS_SWITCH_SIGNALS, data);
+}
+
+/**
+ * Parse card hunt response
+ */
+export function parseHuntResponse(response: Uint8Array): NfcCommandResult {
+  if (response.length < 4) {
+    return {
+      success: false,
+      message: 'Response too short',
+      data: response,
+      hexData: toHex(response),
+    };
+  }
+
+  const len = response[0];
+
+  // Check for "no card" response: LEN <= 4
+  if (len <= 4 && response.length >= 6) {
+    const errorCode = response[4];
+    if (errorCode === 0x6f) {
+      return {
+        success: false,
+        data: response,
+        hexData: toHex(response),
+        message: 'No card in field',
+      };
+    }
+    return {
+      success: false,
+      data: response,
+      hexData: toHex(response),
+      message: `Reader error: 0x${errorCode.toString(16).padStart(2, '0')}`,
+    };
+  }
+
+  // Check for "card found" response
+  if (len >= 0x07 && response.length >= len + 4) {
+    // Response format:
+    // [0] = LEN
+    // [1-3] = CLASS, IDENT, STATUS
+    // [4] = COM type (0x05 = ISO-A, 0x08 = MIFARE, etc.)
+    // [5] = ATR length indicator
+    // [6] = 00
+    // [7] = SAK (or UID length for extended)
+    // [8-11] = UID (4 bytes for standard)
+    // [12] = Status byte
+    // [13-14] = CRC-16
+
+    const comType = response[4];
+
+    // For ISO-A/MIFARE cards, UID is typically at offset 8
+    if (response.length >= 13) {
+      const atqa = response.subarray(4, 6);
+      const sak = response[7];
+      const uid = response.subarray(8, 12);
+      const statusByte = response.length >= 13 ? response[12] : 0;
+
+      if (statusByte === 0x00 || len === 0x0b) {
+        return {
+          success: true,
+          data: uid,
+          hexData: toHex(uid),
+          atqa: toHex(atqa),
+          sak: sak.toString(16).padStart(2, '0').toUpperCase(),
+          comType: comType,
+          message: `Card found! UID: ${toHex(uid)}`,
+        };
+      }
+    }
+  }
+
+  // Unknown response format but contains data
+  return {
+    success: false,
+    data: response,
+    hexData: toHex(response),
+    message: `Unknown response (LEN=0x${len.toString(16)})`,
+  };
 }
 
 /**
@@ -32,9 +222,7 @@ export async function transceive(
   command: Uint8Array,
   timeout: number = 2000
 ): Promise<Uint8Array> {
-  if (device.type === 'usb' && device.usbDevice) {
-    return await usbTransceive(device.usbDevice, command, 256, timeout);
-  } else if (device.type === 'serial' && device.serialDevice) {
+  if (device.serialDevice) {
     return await transceiveSerial(device.serialDevice, command, timeout);
   }
   throw new Error('No device connected');
@@ -73,98 +261,57 @@ export async function sendCommand(
 }
 
 /**
- * Get card UID using ASK RDR-518 proprietary command
- * Command: 80 0a 01 03 00 00 02 11 03 01 01 14 00 9c f8
- *
- * Response format (card found - 15 bytes):
- *   [LEN=0x0b] 01 03 00 [ATQA 2B] 00 [SAK] [UID 4B] [STATUS=0x00] [CRC-16]
- *   Example: 0b 01 03 00 05 06 00 08 8d 69 5d f1 00 e2 4e
- *
- * Response format (no card - 8 bytes):
- *   [LEN=0x04] 01 03 00 [ERROR=0x6f] 00 [CRC-16]
- *   Example: 04 01 03 00 6f 00 1d cb
+ * Card Hunt - Search for cards in the RF field
  */
-export async function getCardUid(device: NfcDevice): Promise<NfcCommandResult> {
-  const command = fromHex('80 0a 01 03 00 00 02 11 03 01 01 14 00 9c f8');
+export async function cardHunt(
+  device: NfcDevice,
+  options: {
+    isoa?: boolean;
+    isob?: boolean;
+    forget?: boolean;
+    timeout10ms?: number;
+  } = {}
+): Promise<NfcCommandResult> {
+  const command = buildHuntCommand(options);
   const result = await sendCommand(device, command);
 
-  if (result.success && result.data && result.data.length >= 8) {
-    const len = result.data[0];
-
-    // Check for "no card" response: LEN=0x04, error code at [4]=0x6f
-    if (len === 0x04 && result.data.length >= 8) {
-      const errorCode = result.data[4];
-      if (errorCode === 0x6f) {
-        return {
-          success: false,
-          data: result.data,
-          hexData: result.hexData,
-          message: 'No card in field',
-        };
-      }
-      return {
-        success: false,
-        data: result.data,
-        hexData: result.hexData,
-        message: `Reader error: 0x${errorCode.toString(16).padStart(2, '0')}`,
-      };
-    }
-
-    // Check for "card found" response: LEN=0x0b (15 bytes total)
-    if (len === 0x0b && result.data.length >= 15) {
-      // Parse card data
-      // [0] = LEN (0x0b = 11)
-      // [1-3] = Header (01 03 00)
-      // [4-5] = ATQA
-      // [6] = 00
-      // [7] = SAK
-      // [8-11] = UID (4 bytes)
-      // [12] = Status
-      // [13-14] = CRC-16
-
-      const atqa = result.data.subarray(4, 6);
-      const sak = result.data[7];
-      const uid = result.data.subarray(8, 12);
-      const status = result.data[12];
-
-      if (status === 0x00) {
-        return {
-          success: true,
-          data: uid,
-          hexData: toHex(uid),
-          atqa: toHex(atqa),
-          sak: sak.toString(16).padStart(2, '0').toUpperCase(),
-          message: `UID: ${toHex(uid)}`,
-        };
-      } else {
-        return {
-          success: false,
-          data: result.data,
-          hexData: result.hexData,
-          message: `Card error: status 0x${status.toString(16).padStart(2, '0')}`,
-        };
-      }
-    }
-
-    // Unknown response format
-    return {
-      success: false,
-      data: result.data,
-      hexData: result.hexData,
-      message: `Unknown response (LEN=0x${len.toString(16)})`,
-    };
-  }
-
-  if (result.success && result.data && result.data.length > 0) {
-    return {
-      success: false,
-      data: result.data,
-      hexData: result.hexData,
-      message: `Incomplete response (${result.data.length} bytes)`,
-    };
+  if (result.success && result.data) {
+    return parseHuntResponse(result.data);
   }
 
   return result;
+}
+
+/**
+ * Get card UID using card hunt
+ */
+export async function getCardUid(device: NfcDevice): Promise<NfcCommandResult> {
+  return await cardHunt(device, {
+    isoa: true,
+    isob: false,
+    forget: true,
+    timeout10ms: 0x14, // 200ms for quick polling
+  });
+}
+
+/**
+ * Control LEDs and buzzer
+ */
+export async function setLeds(device: NfcDevice, param: number): Promise<boolean> {
+  const command = buildLedCommand(param);
+  const result = await sendCommand(device, command);
+  return result.success && !!result.data && result.data.length >= 4 && result.data[3] === 0x00;
+}
+
+/**
+ * Beep and flash LED on success
+ */
+export async function beepSuccess(device: NfcDevice): Promise<void> {
+  await setLeds(device, LED.CPU_LED1 | LED.ANT_BUZZER);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  await setLeds(device, LED.CPU_LED1);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  await setLeds(device, 0x0000);
 }
 
 /**
@@ -185,5 +332,23 @@ export async function sendCustomCommand(
   }
 }
 
-// Re-export utilities
-export { toHex, fromHex };
+/**
+ * Convert byte array to hex string
+ */
+export function toHex(data: Uint8Array): string {
+  return Array.from(data)
+    .map(b => b.toString(16).padStart(2, '0').toUpperCase())
+    .join(' ');
+}
+
+/**
+ * Convert hex string to byte array
+ */
+export function fromHex(hex: string): Uint8Array {
+  const cleanHex = hex.replace(/\s+/g, '');
+  const bytes = new Uint8Array(cleanHex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(cleanHex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
