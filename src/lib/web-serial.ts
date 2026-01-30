@@ -3,7 +3,32 @@
  *
  * This is the preferred method for Windows as WebUSB cannot access
  * devices claimed by the USB Serial driver (usbser.sys).
+ *
+ * ASK RDR-518 Protocol Flow:
+ * 1. Host sends command
+ * 2. Reader responds with ACK (0x01) indicating "processing"
+ * 3. Host sends empty message to poll for result
+ * 4. Reader responds with actual payload
  */
+
+// Logging callback type for external logging
+export type SerialLogCallback = (direction: 'TX' | 'RX' | 'INFO', data: string) => void;
+
+// Global log callback - can be set by the application
+let logCallback: SerialLogCallback | null = null;
+
+export function setSerialLogCallback(callback: SerialLogCallback | null): void {
+  logCallback = callback;
+}
+
+function log(direction: 'TX' | 'RX' | 'INFO', data: string): void {
+  if (logCallback) {
+    logCallback(direction, data);
+  }
+  // Always log to console for debugging
+  const prefix = direction === 'TX' ? '→ TX:' : direction === 'RX' ? '← RX:' : 'ℹ INFO:';
+  console.log(`[Serial] ${prefix} ${data}`);
+}
 
 export interface SerialDevice {
   port: SerialPort;
@@ -70,6 +95,7 @@ export async function requestSerialPort(): Promise<SerialConnectionResult> {
  */
 export async function connectSerialPort(port: SerialPort): Promise<SerialConnectionResult> {
   try {
+    log('INFO', 'Opening serial port at 115200 baud...');
     await port.open({
       baudRate: 115200,
       dataBits: 8,
@@ -81,6 +107,9 @@ export async function connectSerialPort(port: SerialPort): Promise<SerialConnect
     const writer = port.writable?.getWriter() || null;
     const reader = port.readable?.getReader() || null;
 
+    const info = port.getInfo();
+    log('INFO', `Connected to ${info.usbVendorId?.toString(16)}:${info.usbProductId?.toString(16)}`);
+
     return {
       success: true,
       device: {
@@ -90,6 +119,7 @@ export async function connectSerialPort(port: SerialPort): Promise<SerialConnect
       },
     };
   } catch (error) {
+    log('INFO', `Connection failed: ${error instanceof Error ? error.message : String(error)}`);
     return {
       success: false,
       error: `Failed to open port: ${error instanceof Error ? error.message : String(error)}`,
@@ -101,6 +131,7 @@ export async function connectSerialPort(port: SerialPort): Promise<SerialConnect
  * Disconnect from serial port
  */
 export async function disconnectSerialPort(device: SerialDevice): Promise<void> {
+  log('INFO', 'Disconnecting serial port...');
   try {
     if (device.reader) {
       await device.reader.cancel();
@@ -111,7 +142,9 @@ export async function disconnectSerialPort(device: SerialDevice): Promise<void> 
       device.writer.releaseLock();
     }
     await device.port.close();
+    log('INFO', 'Serial port disconnected');
   } catch (error) {
+    log('INFO', `Error disconnecting: ${error instanceof Error ? error.message : String(error)}`);
     console.error('Error disconnecting serial port:', error);
   }
 }
@@ -128,7 +161,11 @@ export async function sendSerialData(device: SerialDevice, data: Uint8Array): Pr
 
 /**
  * Send command and receive response
- * For ASK RDR-518: response format is [LEN] [DATA...] [CRC-16]
+ * For ASK RDR-518: Uses multi-step protocol:
+ * 1. Send command
+ * 2. Receive ACK (0x01)
+ * 3. Send empty message
+ * 4. Receive actual payload
  */
 export async function transceiveSerial(
   device: SerialDevice,
@@ -140,16 +177,56 @@ export async function transceiveSerial(
   }
 
   // Clear any stale data in the buffer first
+  log('INFO', 'Clearing serial buffer...');
   await clearSerialBuffer(device);
 
-  // Send the command
+  // Step 1: Send the command
+  log('TX', `Command (${command.length} bytes): ${toHexSerial(command)}`);
   await sendSerialData(device, command);
 
-  // Wait for device to process command and perform RF operation
-  await new Promise(resolve => setTimeout(resolve, 150));
+  // Step 2: Wait for and read the initial response (ACK or immediate response)
+  log('INFO', 'Waiting for initial response...');
+  await new Promise(resolve => setTimeout(resolve, 50));
 
-  // Read response, looking for a complete frame
-  return await receiveSerialFrame(device, timeout);
+  const initialResponse = await receiveSerialData(device, 500);
+  log('RX', `Initial (${initialResponse.length} bytes): ${toHexSerial(initialResponse)}`);
+
+  // Check if this is an ACK (0x01) requiring us to poll for the actual response
+  if (initialResponse.length === 1 && initialResponse[0] === 0x01) {
+    log('INFO', 'Received ACK (0x01), sending empty poll message...');
+
+    // Step 3: Send empty message to poll for actual response
+    const emptyMessage = new Uint8Array(0);
+    log('TX', `Poll (empty message)`);
+    await sendSerialData(device, emptyMessage);
+
+    // Step 4: Wait for and read the actual response
+    log('INFO', 'Waiting for actual payload...');
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const actualResponse = await receiveSerialFrame(device, timeout);
+    log('RX', `Payload (${actualResponse.length} bytes): ${toHexSerial(actualResponse)}`);
+
+    return actualResponse;
+  }
+
+  // If not an ACK, check if we got a complete frame directly
+  if (isCompleteFrame(initialResponse)) {
+    log('INFO', 'Received complete frame directly');
+    return initialResponse;
+  }
+
+  // Otherwise, continue reading for more data
+  log('INFO', 'Partial data received, continuing to read...');
+  const remainingData = await receiveSerialFrame(device, timeout);
+
+  // Combine initial and remaining data
+  const combined = new Uint8Array(initialResponse.length + remainingData.length);
+  combined.set(initialResponse);
+  combined.set(remainingData, initialResponse.length);
+
+  log('RX', `Combined (${combined.length} bytes): ${toHexSerial(combined)}`);
+  return combined;
 }
 
 /**
@@ -159,6 +236,7 @@ async function clearSerialBuffer(device: SerialDevice): Promise<void> {
   if (!device.reader) return;
 
   const startTime = Date.now();
+  let clearedBytes = 0;
   while (Date.now() - startTime < 100) {
     try {
       const readPromise = device.reader.read();
@@ -169,11 +247,61 @@ async function clearSerialBuffer(device: SerialDevice): Promise<void> {
       if (result.done || !result.value || result.value.length === 0) {
         break; // Buffer is empty
       }
-      // Discard stale data and continue clearing
+      // Log discarded stale data
+      log('RX', `Stale data cleared: ${toHexSerial(result.value)}`);
+      clearedBytes += result.value.length;
     } catch {
       break;
     }
   }
+  if (clearedBytes > 0) {
+    log('INFO', `Cleared ${clearedBytes} stale bytes from buffer`);
+  }
+}
+
+/**
+ * Receive data from serial port (single read with timeout)
+ */
+async function receiveSerialData(
+  device: SerialDevice,
+  timeout: number
+): Promise<Uint8Array> {
+  if (!device.reader) {
+    throw new Error('Serial port reader not available');
+  }
+
+  const chunks: Uint8Array[] = [];
+  const startTime = Date.now();
+  let totalBytes = 0;
+
+  // Read until we get some data or timeout
+  while (Date.now() - startTime < timeout) {
+    const remainingTime = Math.max(50, timeout - (Date.now() - startTime));
+
+    const readPromise = device.reader.read();
+    const timeoutPromise = new Promise<{ value: undefined; done: true }>((resolve) =>
+      setTimeout(() => resolve({ value: undefined, done: true }), Math.min(100, remainingTime))
+    );
+
+    const result = await Promise.race([readPromise, timeoutPromise]);
+
+    if (result.value && result.value.length > 0) {
+      chunks.push(result.value);
+      totalBytes += result.value.length;
+
+      // Small delay to allow more data to arrive if this is a partial read
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      // Check if more data is immediately available
+      continue;
+    } else if (totalBytes > 0) {
+      // We have data and no more is coming
+      break;
+    }
+    // No data yet, keep waiting
+  }
+
+  return combineChunks(chunks, totalBytes);
 }
 
 /**
@@ -192,6 +320,7 @@ async function receiveSerialFrame(
   const chunks: Uint8Array[] = [];
   const startTime = Date.now();
   let totalBytes = 0;
+  let chunkCount = 0;
 
   while (Date.now() - startTime < timeout) {
     const remainingTime = Math.max(50, timeout - (Date.now() - startTime));
@@ -204,25 +333,33 @@ async function receiveSerialFrame(
     const result = await Promise.race([readPromise, timeoutPromise]);
 
     if (result.value && result.value.length > 0) {
+      chunkCount++;
+      log('RX', `Chunk #${chunkCount} (${result.value.length} bytes): ${toHexSerial(result.value)}`);
       chunks.push(result.value);
       totalBytes += result.value.length;
 
       // Check if we have a complete frame
       const combined = combineChunks(chunks, totalBytes);
-      if (isCompleteFrame(combined)) {
+      const frameComplete = isCompleteFrame(combined);
+      log('INFO', `Total: ${totalBytes} bytes, LEN=0x${combined[0]?.toString(16) || '??'}, complete=${frameComplete}`);
+
+      if (frameComplete) {
         return combined;
       }
     } else if (result.done) {
       // Timeout on this read, but keep trying if we don't have data yet
       if (totalBytes > 0) {
         // We have some data, wait a bit more then check
+        log('INFO', `Read timeout with ${totalBytes} bytes received, waiting...`);
         await new Promise(resolve => setTimeout(resolve, 50));
       }
     }
   }
 
   // Return whatever we got
-  return combineChunks(chunks, totalBytes);
+  const result = combineChunks(chunks, totalBytes);
+  log('INFO', `Frame read complete: ${totalBytes} bytes in ${chunkCount} chunks`);
+  return result;
 }
 
 /**
@@ -240,6 +377,8 @@ function combineChunks(chunks: Uint8Array[], totalLength: number): Uint8Array {
 
 /**
  * Check if we have a complete frame based on LEN byte
+ * Frame structure: [LEN][CLASS][IDENT][STATUS][DATA...][CRC-16]
+ * Total expected = LEN + 2 (for the LEN byte itself and trailing bytes) + 2 (CRC)
  */
 function isCompleteFrame(data: Uint8Array): boolean {
   if (data.length < 4) return false;
@@ -247,12 +386,13 @@ function isCompleteFrame(data: Uint8Array): boolean {
   const len = data[0];
 
   // Known frame sizes for ASK RDR-518:
-  // LEN=0x04: no-card response, total 8 bytes (4 + 2 data + 2 CRC)
+  // LEN=0x04: no-card response, total 8 bytes (LEN + 4 data + 2 CRC + 1)
   // LEN=0x0b: card-found response, total 15 bytes
   if (len === 0x04 && data.length >= 8) return true;
   if (len === 0x0b && data.length >= 15) return true;
 
-  // Generic check: LEN + 4 bytes (header estimate)
+  // Generic check: LEN value + 4 bytes (for LEN byte + some header + CRC)
+  // The LEN field typically indicates payload size after the header
   if (data.length >= len + 4) return true;
 
   return false;
