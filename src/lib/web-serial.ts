@@ -19,7 +19,7 @@ export interface SerialConnectionResult {
 
 // Known NFC reader USB vendor/product IDs for serial filter
 export const KNOWN_SERIAL_NFC_READERS = [
-  { usbVendorId: 0x1fd3, usbProductId: 0x0108 }, // RDR-518 NFC Reader
+  { usbVendorId: 0x1fd3, usbProductId: 0x0108 }, // ASK RDR-518
   { usbVendorId: 0x072f }, // ACS readers
   { usbVendorId: 0x1a86 }, // CH340
   { usbVendorId: 0x0403 }, // FTDI
@@ -212,7 +212,7 @@ export function getSerialPortInfo(port: SerialPort): string {
   const info = port.getInfo();
 
   if (info.usbVendorId === 0x1fd3 && info.usbProductId === 0x0108) {
-    return 'RDR-518 NFC Reader';
+    return 'ASK RDR-518';
   }
   if (info.usbVendorId === 0x072f) {
     return 'ACS NFC Reader';
