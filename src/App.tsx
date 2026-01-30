@@ -35,6 +35,7 @@ function App() {
   const [lastUid, setLastUid] = useState<string>('');
   const [lastAtqa, setLastAtqa] = useState<string>('');
   const [lastSak, setLastSak] = useState<string>('');
+  const [cardStatus, setCardStatus] = useState<string>('');
   const [firmwareInfo, setFirmwareInfo] = useState<NfcVersionInfo | null>(null);
   const huntingRef = useRef<boolean>(false);
 
@@ -123,6 +124,7 @@ function App() {
         setLastUid(result.hexData);
         setLastAtqa(result.atqa || '');
         setLastSak(result.sak || '');
+        setCardStatus('');
         addLog('response', `UID: ${result.hexData}`);
         if (result.atqa) addLog('response', `ATQA: ${result.atqa}`);
         if (result.sak) addLog('response', `SAK: ${result.sak}`);
@@ -133,10 +135,11 @@ function App() {
       }
     } else {
       addLog('info', result.message);
-      // Clear card info when no card found
+      // Clear card info and show status when no card found
       setLastUid('');
       setLastAtqa('');
       setLastSak('');
+      setCardStatus(result.message);
       if (result.hexData) {
         addLog('response', `Raw: ${result.hexData}`);
       }
@@ -194,6 +197,7 @@ function App() {
                 setLastUid(result.hexData);
                 setLastAtqa(result.atqa || '');
                 setLastSak(result.sak || '');
+                setCardStatus('');
                 addLog('success', `Card detected! UID: ${result.hexData}`);
                 await beepSuccess(device);
               }
@@ -204,6 +208,7 @@ function App() {
                 setLastUid('');
                 setLastAtqa('');
                 setLastSak('');
+                setCardStatus(result.message);
               }
             }
           } catch {
@@ -350,10 +355,10 @@ function App() {
           )}
         </section>
 
-        {/* UID Display */}
-        {lastUid && (
+        {/* Card Status Display */}
+        {lastUid ? (
           <section className="bg-green-900/30 border border-green-500/50 rounded-lg p-6 mb-6">
-            <h2 className="text-xl font-semibold mb-2 text-green-300">Last Detected Card</h2>
+            <h2 className="text-xl font-semibold mb-2 text-green-300">Card Detected</h2>
             <div className="font-mono text-2xl text-green-400 mb-2">{lastUid}</div>
             {(lastAtqa || lastSak) && (
               <div className="text-sm text-gray-400">
@@ -361,6 +366,11 @@ function App() {
                 {lastSak && <span>SAK: {lastSak}</span>}
               </div>
             )}
+          </section>
+        ) : cardStatus && (
+          <section className="bg-gray-800 border border-gray-600 rounded-lg p-6 mb-6">
+            <h2 className="text-xl font-semibold mb-2 text-gray-400">Card Status</h2>
+            <div className="text-lg text-gray-500">{cardStatus}</div>
           </section>
         )}
 
