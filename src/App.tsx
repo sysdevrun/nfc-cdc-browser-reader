@@ -1,13 +1,18 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
+import {
+  isWebSerialSupported,
+  requestSerialPort,
+  disconnectSerialPort,
+  getSerialPortInfo,
+} from './lib/web-serial';
 import {
   isWebUsbSupported,
-  requestDevice,
-  disconnectDevice,
+  requestDevice as requestUsbDevice,
+  disconnectDevice as disconnectUsbDevice,
   getDeviceInfo,
-  fromHex,
-  UsbCdcDevice,
 } from './lib/usb-cdc';
 import {
+  NfcDevice,
   NfcCommandResult,
   getFirmwareVersion,
   getSerialNumber,
@@ -22,8 +27,8 @@ import {
   authenticate,
   loadKey,
   sendCustomApdu,
-  sendRawCommand,
-} from './lib/nfc-commands';
+  fromHex,
+} from './lib/nfc-device';
 
 interface LogEntry {
   id: number;
@@ -33,13 +38,13 @@ interface LogEntry {
 }
 
 function App() {
-  const [device, setDevice] = useState<UsbCdcDevice | null>(null);
-  const [deviceName, setDeviceName] = useState<string>('');
+  const [device, setDevice] = useState<NfcDevice | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [customCommand, setCustomCommand] = useState<string>('FF CA 00 00 00');
   const [blockNumber, setBlockNumber] = useState<number>(0);
   const [isPolling, setIsPolling] = useState<boolean>(false);
   const [lastUid, setLastUid] = useState<string>('');
+  const pollingRef = useRef<boolean>(false);
 
   const addLog = useCallback((type: LogEntry['type'], message: string) => {
     setLogs(prev => [...prev, {
@@ -54,20 +59,49 @@ function App() {
     setLogs([]);
   }, []);
 
-  const handleConnect = async () => {
+  // Connect via Web Serial (preferred for Windows)
+  const handleConnectSerial = async () => {
+    if (!isWebSerialSupported()) {
+      addLog('error', 'Web Serial API is not supported. Please use Chrome or Edge.');
+      return;
+    }
+
+    addLog('info', 'Requesting serial port...');
+    const result = await requestSerialPort();
+
+    if (result.success && result.device) {
+      const name = getSerialPortInfo(result.device.port);
+      const nfcDevice: NfcDevice = {
+        type: 'serial',
+        name,
+        serialDevice: result.device,
+      };
+      setDevice(nfcDevice);
+      addLog('success', `Connected via Serial: ${name}`);
+    } else {
+      addLog('error', result.error || 'Failed to connect');
+    }
+  };
+
+  // Connect via WebUSB (fallback)
+  const handleConnectUsb = async () => {
     if (!isWebUsbSupported()) {
-      addLog('error', 'WebUSB is not supported in this browser. Please use Chrome, Edge, or Opera.');
+      addLog('error', 'WebUSB is not supported. Please use Chrome, Edge, or Opera.');
       return;
     }
 
     addLog('info', 'Requesting USB device...');
-    const result = await requestDevice();
+    const result = await requestUsbDevice();
 
     if (result.success && result.device) {
-      setDevice(result.device);
       const name = getDeviceInfo(result.device.device);
-      setDeviceName(name);
-      addLog('success', `Connected to: ${name}`);
+      const nfcDevice: NfcDevice = {
+        type: 'usb',
+        name,
+        usbDevice: result.device,
+      };
+      setDevice(nfcDevice);
+      addLog('success', `Connected via USB: ${name}`);
       addLog('info', `Interface: ${result.device.interfaceNumber}, EP In: ${result.device.endpointIn}, EP Out: ${result.device.endpointOut}`);
     } else {
       addLog('error', result.error || 'Failed to connect');
@@ -76,10 +110,16 @@ function App() {
 
   const handleDisconnect = async () => {
     if (device) {
+      pollingRef.current = false;
       setIsPolling(false);
-      await disconnectDevice(device);
+
+      if (device.type === 'serial' && device.serialDevice) {
+        await disconnectSerialPort(device.serialDevice);
+      } else if (device.type === 'usb' && device.usbDevice) {
+        await disconnectUsbDevice(device.usbDevice);
+      }
+
       setDevice(null);
-      setDeviceName('');
       setLastUid('');
       addLog('info', 'Disconnected from device');
     }
@@ -187,18 +227,16 @@ function App() {
     }
   };
 
-  const handleCustomCommand = async (raw: boolean = false) => {
+  const handleCustomCommand = async () => {
     if (!device) {
       addLog('error', 'No device connected');
       return;
     }
 
-    addLog('command', `Sending ${raw ? 'raw' : 'APDU'}: ${customCommand}`);
+    addLog('command', `Sending APDU: ${customCommand}`);
 
     try {
-      const result = raw
-        ? await sendRawCommand(device, customCommand)
-        : await sendCustomApdu(device, customCommand);
+      const result = await sendCustomApdu(device, customCommand);
 
       if (result.success) {
         addLog('success', result.message);
@@ -220,46 +258,34 @@ function App() {
     }
 
     if (isPolling) {
+      pollingRef.current = false;
       setIsPolling(false);
       addLog('info', 'Stopped continuous polling');
     } else {
+      pollingRef.current = true;
       setIsPolling(true);
       addLog('info', 'Started continuous polling (every 500ms)');
 
-      const pollLoop = async () => {
-        let polling = true;
-        const checkPolling = () => {
-          // Check current state
-          return polling;
-        };
+      let lastDetectedUid = '';
 
-        while (checkPolling()) {
-          const result = await getCardUid(device);
-          if (result.success && result.hexData) {
-            if (result.hexData !== lastUid) {
-              setLastUid(result.hexData);
-              addLog('success', `Card detected! UID: ${result.hexData}`);
+      const pollLoop = async () => {
+        while (pollingRef.current && device) {
+          try {
+            const result = await getCardUid(device);
+            if (result.success && result.hexData) {
+              if (result.hexData !== lastDetectedUid) {
+                lastDetectedUid = result.hexData;
+                setLastUid(result.hexData);
+                addLog('success', `Card detected! UID: ${result.hexData}`);
+              }
+            } else {
+              lastDetectedUid = '';
             }
+          } catch (error) {
+            // Ignore polling errors
           }
 
-          // Check if still polling before waiting
-          await new Promise<void>(resolve => {
-            const timeout = setTimeout(() => {
-              resolve();
-            }, 500);
-
-            // Store cleanup
-            const cleanup = () => {
-              clearTimeout(timeout);
-              polling = false;
-              resolve();
-            };
-
-            // Check isPolling state after mounting
-            if (!document.querySelector('[data-polling="true"]')) {
-              cleanup();
-            }
-          });
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
       };
 
@@ -267,7 +293,8 @@ function App() {
     }
   };
 
-  const webUsbSupported = isWebUsbSupported();
+  const serialSupported = isWebSerialSupported();
+  const usbSupported = isWebUsbSupported();
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-4">
@@ -275,15 +302,15 @@ function App() {
         <header className="mb-8">
           <h1 className="text-3xl font-bold text-blue-400 mb-2">NFC CDC Browser Reader</h1>
           <p className="text-gray-400">
-            Web USB interface for ACS ACR518 and compatible NFC readers in CDC mode
+            Web interface for NFC readers in CDC/Serial mode (RDR-518, ACR518, etc.)
           </p>
         </header>
 
-        {!webUsbSupported && (
+        {!serialSupported && !usbSupported && (
           <div className="bg-red-900/50 border border-red-500 rounded-lg p-4 mb-6">
-            <h2 className="text-red-400 font-semibold mb-2">WebUSB Not Supported</h2>
+            <h2 className="text-red-400 font-semibold mb-2">Not Supported</h2>
             <p className="text-gray-300">
-              Your browser does not support WebUSB. Please use Chrome, Edge, or Opera on desktop.
+              Your browser does not support Web Serial or WebUSB. Please use Chrome or Edge.
             </p>
           </div>
         )}
@@ -293,18 +320,31 @@ function App() {
           <h2 className="text-xl font-semibold mb-4 text-blue-300">Device Connection</h2>
           <div className="flex flex-wrap items-center gap-4">
             {!device ? (
-              <button
-                onClick={handleConnect}
-                disabled={!webUsbSupported}
-                className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-2 rounded-lg font-medium transition-colors"
-              >
-                Connect Reader
-              </button>
+              <>
+                <button
+                  onClick={handleConnectSerial}
+                  disabled={!serialSupported}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-6 py-2 rounded-lg font-medium transition-colors"
+                >
+                  Connect (Serial)
+                </button>
+                <button
+                  onClick={handleConnectUsb}
+                  disabled={!usbSupported}
+                  className="bg-gray-600 hover:bg-gray-500 disabled:bg-gray-700 disabled:cursor-not-allowed px-6 py-2 rounded-lg font-medium transition-colors"
+                >
+                  Connect (USB)
+                </button>
+                <span className="text-gray-500 text-sm">
+                  {serialSupported ? '← Recommended for Windows' : ''}
+                </span>
+              </>
             ) : (
               <>
                 <div className="flex items-center gap-2">
                   <span className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></span>
-                  <span className="text-green-400 font-medium">{deviceName}</span>
+                  <span className="text-green-400 font-medium">{device.name}</span>
+                  <span className="text-gray-500 text-sm">({device.type})</span>
                 </div>
                 <button
                   onClick={handleDisconnect}
@@ -326,7 +366,7 @@ function App() {
         )}
 
         {/* Commands Grid */}
-        <section className="bg-gray-800 rounded-lg p-6 mb-6" data-polling={isPolling}>
+        <section className="bg-gray-800 rounded-lg p-6 mb-6">
           <h2 className="text-xl font-semibold mb-4 text-blue-300">Reader Commands</h2>
 
           <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
@@ -407,11 +447,8 @@ function App() {
                 placeholder="FF CA 00 00 00"
                 className="flex-1 min-w-64 bg-gray-700 border border-gray-600 rounded px-3 py-2 font-mono text-white"
               />
-              <CommandButton onClick={() => handleCustomCommand(false)} disabled={!device}>
+              <CommandButton onClick={handleCustomCommand} disabled={!device}>
                 Send APDU
-              </CommandButton>
-              <CommandButton onClick={() => handleCustomCommand(true)} disabled={!device}>
-                Send Raw
               </CommandButton>
             </div>
             <p className="text-gray-500 text-sm mt-2">
@@ -461,10 +498,10 @@ function App() {
         {/* Footer */}
         <footer className="mt-8 text-center text-gray-500 text-sm">
           <p>
-            NFC CDC Browser Reader - Uses WebUSB to communicate with NFC readers in CDC mode
+            NFC CDC Browser Reader - Uses Web Serial / WebUSB to communicate with NFC readers
           </p>
           <p className="mt-1">
-            Tested with ACS ACR1281S-C1 (ACR518), ACR122U, ACR1252U
+            Tested with RDR-518, ACS ACR1281S-C1 (ACR518), ACR122U, ACR1252U
           </p>
         </footer>
       </div>
