@@ -24,7 +24,10 @@ interface LogEntry {
   message: string;
 }
 
+type Territory = 'la-reunion' | 'mayotte';
+
 function App() {
+  const [territory, setTerritory] = useState<Territory>('la-reunion');
   const [device, setDevice] = useState<NfcDevice | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [customCommand, setCustomCommand] = useState<string>('');
@@ -271,12 +274,36 @@ function App() {
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-4">
       <div className="max-w-4xl mx-auto">
-        <header className="mb-8">
+        <header className="mb-6">
           <h1 className="text-3xl font-bold text-blue-400 mb-2">NFC Card Hunt Reader</h1>
           <p className="text-gray-400">
             ASK CSC Protocol interface for RDR-518 NFC reader
           </p>
         </header>
+
+        {/* Territory Switcher */}
+        <div className="flex gap-4 mb-6">
+          <button
+            onClick={() => setTerritory('la-reunion')}
+            className={`flex-1 py-4 px-6 rounded-xl text-xl font-bold transition-all ${
+              territory === 'la-reunion'
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/30 scale-[1.02]'
+                : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
+            }`}
+          >
+            La Réunion
+          </button>
+          <button
+            onClick={() => setTerritory('mayotte')}
+            className={`flex-1 py-4 px-6 rounded-xl text-xl font-bold transition-all ${
+              territory === 'mayotte'
+                ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30 scale-[1.02]'
+                : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
+            }`}
+          >
+            Mayotte
+          </button>
+        </div>
 
         {!serialSupported && (
           <div className="bg-red-900/50 border border-red-500 rounded-lg p-4 mb-6">
@@ -337,9 +364,26 @@ function App() {
 
         {/* Card Status Display */}
         {lastUid ? (
-          <section className="bg-green-900/30 border border-green-500/50 rounded-lg p-6 mb-6">
-            <h2 className="text-xl font-semibold mb-2 text-green-300">Card Detected</h2>
-            <div className="font-mono text-2xl text-green-400 mb-2">{lastUid}</div>
+          <section className={`rounded-lg p-6 mb-6 border ${
+            territory === 'la-reunion'
+              ? 'bg-blue-900/30 border-blue-500/50'
+              : 'bg-emerald-900/30 border-emerald-500/50'
+          }`}>
+            <div className="flex items-center justify-between mb-2">
+              <h2 className={`text-xl font-semibold ${
+                territory === 'la-reunion' ? 'text-blue-300' : 'text-emerald-300'
+              }`}>Card Detected</h2>
+              <span className={`text-sm px-3 py-1 rounded-full ${
+                territory === 'la-reunion'
+                  ? 'bg-blue-600/20 text-blue-400'
+                  : 'bg-emerald-600/20 text-emerald-400'
+              }`}>
+                {territory === 'la-reunion' ? 'La Réunion' : 'Mayotte'}
+              </span>
+            </div>
+            <div className={`font-mono text-2xl mb-2 ${
+              territory === 'la-reunion' ? 'text-blue-400' : 'text-emerald-400'
+            }`}>{lastUid}</div>
             {(lastAtqa || lastSak) && (
               <div className="text-sm text-gray-400">
                 {lastAtqa && <span className="mr-4">ATQA: {lastAtqa}</span>}
@@ -355,8 +399,23 @@ function App() {
         )}
 
         {/* Card Hunt Section */}
-        <section className="bg-gray-800 rounded-lg p-6 mb-6">
-          <h2 className="text-xl font-semibold mb-4 text-blue-300">Card Hunt</h2>
+        <section className={`rounded-lg p-6 mb-6 border-2 ${
+          territory === 'la-reunion'
+            ? 'bg-gray-800 border-blue-600/30'
+            : 'bg-gray-800 border-emerald-600/30'
+        }`}>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className={`text-xl font-semibold ${
+              territory === 'la-reunion' ? 'text-blue-300' : 'text-emerald-300'
+            }`}>Card Hunt</h2>
+            <span className={`text-sm px-3 py-1 rounded-full ${
+              territory === 'la-reunion'
+                ? 'bg-blue-600/20 text-blue-400'
+                : 'bg-emerald-600/20 text-emerald-400'
+            }`}>
+              {territory === 'la-reunion' ? 'La Réunion' : 'Mayotte'}
+            </span>
+          </div>
 
           <div className="flex flex-wrap gap-3 mb-4">
             <button
@@ -364,7 +423,9 @@ function App() {
               disabled={!device || isHunting}
               className={`px-6 py-3 rounded-lg font-medium transition-colors text-lg ${
                 device && !isHunting
-                  ? 'bg-purple-600 hover:bg-purple-700 text-white'
+                  ? territory === 'la-reunion'
+                    ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
                   : 'bg-gray-800 text-gray-500 cursor-not-allowed'
               }`}
             >
@@ -377,8 +438,10 @@ function App() {
                 !device
                   ? 'bg-gray-800 text-gray-500 cursor-not-allowed'
                   : isHunting
-                  ? 'bg-orange-600 hover:bg-orange-700 text-white'
-                  : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                  ? 'bg-orange-600 hover:bg-orange-700 text-white animate-pulse'
+                  : territory === 'la-reunion'
+                    ? 'bg-blue-700/50 hover:bg-blue-600 text-blue-100'
+                    : 'bg-emerald-700/50 hover:bg-emerald-600 text-emerald-100'
               }`}
             >
               {isHunting ? 'Stop Hunt' : 'Continuous Hunt'}
